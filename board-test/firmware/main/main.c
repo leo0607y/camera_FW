@@ -37,6 +37,8 @@ static bool stable[2], candidate[2];
 static unsigned counts[2], changed[2], tick;
 static unsigned camera_clock = 20000000;
 static int camera_profile;
+// 細かい景色でJPEGが受信バッファに入らないとフレームが来ない。そのときだけ品質の数字を上げる（モード切替・再準備で0に戻す）
+static int quality_boost;
 static int64_t camera_started;
 static const char *sd_stage = "not_tested";
 static int sd_errno;
@@ -129,27 +131,38 @@ static int usb_write(const void *data, size_t size, void *context) {
     (void)context;
     return usb_serial_jtag_write_bytes(data, size, pdMS_TO_TICKS(500));
 }
+// 画像(base64)はJSON文字列に組み込まず、外して先頭に直接書く。全体を1本の文字列にすると
+// 画像の数倍の連続したPSRAMが要り、縞除去中だと取れずにNO_MEMになる
+static const char *const image_keys[2]={"jpeg","jpeg_raw"};
 static void send_json(cJSON *j) {
     xSemaphoreTake(usb_mutex,portMAX_DELAY);
+    cJSON *images[2];for(int i=0;i<2;i++)images[i]=cJSON_DetachItemFromObject(j,image_keys[i]);
     char *s=cJSON_PrintUnformatted(j);
-    if(!s&&cJSON_HasObjectItem(j,"jpeg")){ // 画像付きが作れなければ画像を外してエラーで返す（黙るとPC側はタイムアウトになる）
-        cJSON_DeleteItemFromObject(j,"jpeg");cJSON_DeleteItemFromObject(j,"jpeg_raw");
-        cJSON_ReplaceItemInObject(j,"ok",cJSON_CreateBool(false));cJSON_ReplaceItemInObject(j,"error",cJSON_CreateString(esp_err_to_name(ESP_ERR_NO_MEM)));
-        s=cJSON_PrintUnformatted(j);
-    }
     if(s){
         // 再接続時に古い応答の残りが来ることがあるので改行から始める
         usb_serial_jtag_write_bytes("\n",1,pdMS_TO_TICKS(100));
-        board_usb_send(s, strlen(s), usb_write, NULL);
+        bool good=true,any=false;
+        for(int i=0;i<2&&good;i++){
+            if(!cJSON_IsString(images[i]))continue;
+            char key[16];int n=snprintf(key,sizeof(key),"%s\"%s\":\"",any?",":"{",image_keys[i]);any=true;
+            good=board_usb_send(key,n,usb_write,NULL)&&board_usb_send(images[i]->valuestring,strlen(images[i]->valuestring),usb_write,NULL)&&board_usb_send("\"",1,usb_write,NULL);
+        }
+        // 残りは '{' を飛ばしてつなぐ（idやstatusが必ずあるので空にはならない）
+        if(good&&board_usb_send(any?",":"{",1,usb_write,NULL))board_usb_send(s+1,strlen(s+1),usb_write,NULL);
         // 途中で切れても行を閉じる（次の要求で同期できるように）
         usb_serial_jtag_write_bytes("\n",1,pdMS_TO_TICKS(100)); free(s);
+    }else{ // 内部RAMが足りずJSONが作れなくても、idだけ付けてエラーを返す（黙るとPC側はタイムアウトになる）
+        cJSON *id=cJSON_GetObjectItem(j,"id");char line[96];
+        int n=snprintf(line,sizeof(line),"\n{\"id\":%d,\"ok\":false,\"error\":\"%s\"}\n",cJSON_IsNumber(id)?id->valueint:0,esp_err_to_name(ESP_ERR_NO_MEM));
+        board_usb_send(line,n,usb_write,NULL);
     }
+    for(int i=0;i<2;i++)cJSON_Delete(images[i]);
     cJSON_Delete(j);
     xSemaphoreGive(usb_mutex);
 }
 static esp_err_t apply_mode_settings(sensor_t *s,bool live){
     const camera_mode *m=&camera_modes[active_mode];
-    if(live&&(s->set_framesize(s,(framesize_t)m->size)||s->set_quality(s,m->quality)))return ESP_FAIL;
+    if(live&&(s->set_framesize(s,(framesize_t)m->size)||s->set_quality(s,m->quality+quality_boost)))return ESP_FAIL;
     if(gain_limit>=0&&s->set_gainceiling(s,(gainceiling_t)gain_limit))return ESP_FAIL;
     if(s->set_saturation(s,m->saturation)||s->set_contrast(s,m->contrast)||s->set_aec2(s,m->night?1:0)||s->set_brightness(s,m->night?1:0)||s->set_special_effect(s,m->effect))return ESP_FAIL;
     return ESP_OK;
@@ -161,7 +174,7 @@ static esp_err_t camera_init(void) {
         .pin_d0=40,.pin_d1=9,.pin_d2=8,.pin_d3=41,.pin_d4=3,.pin_d5=18,.pin_d6=17,.pin_d7=16,
         .pin_vsync=6,.pin_href=7,.pin_pclk=39,.xclk_freq_hz=camera_clock,
         .ledc_timer=LEDC_TIMER_0,.ledc_channel=LEDC_CHANNEL_0,
-        .pixel_format=PIXFORMAT_JPEG,.frame_size=camera_modes[active_mode].size,.jpeg_quality=camera_modes[active_mode].quality,.fb_count=camera_modes[active_mode].video?2:1,
+        .pixel_format=PIXFORMAT_JPEG,.frame_size=camera_modes[active_mode].size,.jpeg_quality=camera_modes[active_mode].quality+quality_boost,.fb_count=camera_modes[active_mode].video?2:1,
         .fb_location=CAMERA_FB_IN_PSRAM,.grab_mode=camera_modes[active_mode].video?CAMERA_GRAB_LATEST:CAMERA_GRAB_WHEN_EMPTY
     };
     esp_err_t e=esp_camera_init(&c); camera_ready=e==ESP_OK;
@@ -221,6 +234,7 @@ static void add_status(cJSON *r, esp_err_t e){
     cJSON_AddBoolToObject(r,"ok",e==ESP_OK);cJSON_AddStringToObject(r,"error",esp_err_to_name(e));
     cJSON_AddNumberToObject(r,"adc",ae==ESP_OK?raw:-1);
     cJSON_AddNumberToObject(r,"psram",heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+    cJSON_AddNumberToObject(r,"jpeg_quality",camera_modes[active_mode].quality+quality_boost);cJSON_AddNumberToObject(r,"quality_boost",quality_boost);
     // 空き/最大ブロック。内部RAMが尽きると応答のJSONが作れずUSBが黙る
     cJSON_AddNumberToObject(r,"heap_internal",heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));
     cJSON_AddNumberToObject(r,"heap_internal_block",heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));
@@ -260,10 +274,13 @@ static void add_status(cJSON *r, esp_err_t e){
 static esp_err_t add_image(cJSON *r,const uint8_t *data,size_t len){
     size_t cap=4*((len+2)/3)+1,written=0;
     unsigned char *b=malloc(cap);if(!b)return ESP_ERR_NO_MEM;
-    esp_err_t e=ESP_OK;
-    if(mbedtls_base64_encode(b,cap,&written,data,len))e=ESP_FAIL;
-    else if(!cJSON_AddStringToObject(r,"jpeg",(char*)b))e=ESP_ERR_NO_MEM;
-    free(b);return e;
+    if(mbedtls_base64_encode(b,cap,&written,data,len)){free(b);return ESP_FAIL;}
+    // コピーせずにbをそのまま持たせる（cJSONはvaluestringをfreeで解放する）
+    cJSON *item=cJSON_CreateString("");
+    if(!item){free(b);return ESP_ERR_NO_MEM;}
+    cJSON_free(item->valuestring);item->valuestring=(char*)b;
+    cJSON_DeleteItemFromObject(r,"jpeg");cJSON_AddItemToObject(r,"jpeg",item);
+    return ESP_OK;
 }
 static esp_err_t sd_probe_locked(cJSON *r){
     spi_bus_config_t bus={.mosi_io_num=11,.miso_io_num=13,.sclk_io_num=12,.quadwp_io_num=-1,.quadhd_io_num=-1,.max_transfer_sz=4096};
@@ -401,12 +418,17 @@ static esp_err_t sd_save(camera_fb_t *frame,cJSON *reply){
 }
 static camera_fb_t *settled_frame(bool startup,esp_err_t *error){
     quality_gate gate={0};int64_t started=esp_timer_get_time();unsigned invalid=0;
-    unsigned observed=0;
+    unsigned observed=0,boosts=0;
     if(!startup){gate.previous=latest_quality;gate.has_previous=true;}
     const unsigned minimum=startup?4000:0,limit=startup?25000:10000;
-    while((esp_timer_get_time()-started)/1000<limit){
+    while((esp_timer_get_time()-started)/1000<limit+boosts*6000){
         camera_fb_t *frame=esp_camera_fb_get();frame_quality q={0};
         observed++;
+        if(!frame&&camera_ready&&quality_boost<16){ // フレームが来ない＝JPEGがバッファに入らない。圧縮を強めてやり直す
+            sensor_t *s=esp_camera_sensor_get();quality_boost+=4;boosts++;
+            if(s)s->set_quality(s,camera_modes[active_mode].quality+quality_boost);
+            continue;
+        }
         unsigned before_decode=(esp_timer_get_time()-started)/1000;
         if(startup&&before_decode<2500&&frame&&frame->len>1024){
             warmed_frames=observed;warmup_ms=before_decode;
@@ -444,7 +466,7 @@ static void add_ap_status(cJSON *r){
     cJSON_AddNumberToObject(r,"ap_clients",ap_clients());
 }
 static void prepare_camera(void){
-    set_phase("switching",false,ESP_OK);
+    set_phase("switching",false,ESP_OK);quality_boost=0;
     esp_err_t stopped=ap_gallery_stop();
     if(stopped!=ESP_OK){sd_ready=false;finish_job(stopped);return;}
     if(active_mode==7){
@@ -488,8 +510,10 @@ static esp_err_t take_photo(cJSON *reply){
         photo.buf=photo_copy(frame->buf,frame->len);esp_camera_fb_return(frame);
         if(!photo.buf)return ESP_ERR_NO_MEM;
         e=sd_save(&photo,reply);
-        // 撮ってSDに入れてから、USBの返信分（base64+cJSON+文字列で約4倍）が空くのを待つ。シャッターは待たせない
-        if(e==ESP_OK){set_phase("sending",false,ESP_OK);cleanup_make_room(photo.len*4+512*1024,15000);e=add_image(reply,photo.buf,photo.len);}
+        // 撮ってSDに入れてから、USBの返信分（base64で約1.4倍）が空くのを待つ。シャッターは待たせない
+        if(e==ESP_OK){set_phase("sending",false,ESP_OK);cleanup_make_room(photo.len*3/2+256*1024,15000);
+            // SDには入っているので、PCに画像を送れなくても撮影は成功扱い（赤を点けない）
+            cJSON_AddBoolToObject(reply,"image_sent",add_image(reply,photo.buf,photo.len)==ESP_OK);}
         if(e==ESP_OK)cleanup_queue(photo.buf,photo.len,photo.width,photo.height); // jpegはここで渡す。last_photoはこのファイルのまま
         else free(photo.buf);
     }
