@@ -132,6 +132,11 @@ static int usb_write(const void *data, size_t size, void *context) {
 static void send_json(cJSON *j) {
     xSemaphoreTake(usb_mutex,portMAX_DELAY);
     char *s=cJSON_PrintUnformatted(j);
+    if(!s&&cJSON_HasObjectItem(j,"jpeg")){ // 画像付きが作れなければ画像を外してエラーで返す（黙るとPC側はタイムアウトになる）
+        cJSON_DeleteItemFromObject(j,"jpeg");cJSON_DeleteItemFromObject(j,"jpeg_raw");
+        cJSON_ReplaceItemInObject(j,"ok",cJSON_CreateBool(false));cJSON_ReplaceItemInObject(j,"error",cJSON_CreateString(esp_err_to_name(ESP_ERR_NO_MEM)));
+        s=cJSON_PrintUnformatted(j);
+    }
     if(s){
         // 再接続時に古い応答の残りが来ることがあるので改行から始める
         usb_serial_jtag_write_bytes("\n",1,pdMS_TO_TICKS(100));
@@ -216,6 +221,12 @@ static void add_status(cJSON *r, esp_err_t e){
     cJSON_AddBoolToObject(r,"ok",e==ESP_OK);cJSON_AddStringToObject(r,"error",esp_err_to_name(e));
     cJSON_AddNumberToObject(r,"adc",ae==ESP_OK?raw:-1);
     cJSON_AddNumberToObject(r,"psram",heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+    // 空き/最大ブロック。内部RAMが尽きると応答のJSONが作れずUSBが黙る
+    cJSON_AddNumberToObject(r,"heap_internal",heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));
+    cJSON_AddNumberToObject(r,"heap_internal_block",heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));
+    cJSON_AddNumberToObject(r,"heap_internal_min",heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));
+    cJSON_AddNumberToObject(r,"heap_psram",heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    cJSON_AddNumberToObject(r,"heap_psram_block",heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     cJSON_AddStringToObject(r,"sd_stage",sd_stage);cJSON_AddNumberToObject(r,"sd_khz",sd_khz);cJSON_AddNumberToObject(r,"sd_errno",sd_errno);
     cJSON_AddStringToObject(r,"phase",phase);cJSON_AddBoolToObject(r,"ready",capture_ready);
     cJSON_AddBoolToObject(r,"busy",busy);cJSON_AddBoolToObject(r,"sd_ready",sd_ready);
@@ -465,8 +476,10 @@ static void prepare_camera(void){
 static esp_err_t take_photo(cJSON *reply){
     set_phase("metering",false,ESP_OK);esp_err_t e=ESP_OK;
     if(!camera_ready||!sd_ready||!image_settled)return ESP_ERR_INVALID_STATE;
+    // 縞除去待ちは3枚まで（1枚6秒くらいかかるので、溜めるとPSRAMが尽きて返信が作れなくなる）
+    // 加えてフレームのコピー分を先に空ける（フレームは長く持てない）
+    cleanup_wait_backlog(3,30000);cleanup_make_room(1024*1024,15000);
     // シャッターより前のフレームを捨てる
-    cleanup_make_room(3*1024*1024,15000); // 前の写真の縞除去中でもUSBの返信分を空ける
     camera_fb_t *old=esp_camera_fb_get();if(old)esp_camera_fb_return(old);
     camera_fb_t *frame=settled_frame(false,&e);
     if(frame){
@@ -475,7 +488,8 @@ static esp_err_t take_photo(cJSON *reply){
         photo.buf=photo_copy(frame->buf,frame->len);esp_camera_fb_return(frame);
         if(!photo.buf)return ESP_ERR_NO_MEM;
         e=sd_save(&photo,reply);
-        if(e==ESP_OK){set_phase("sending",false,ESP_OK);e=add_image(reply,photo.buf,photo.len);}
+        // 撮ってSDに入れてから、USBの返信分（base64+cJSON+文字列で約4倍）が空くのを待つ。シャッターは待たせない
+        if(e==ESP_OK){set_phase("sending",false,ESP_OK);cleanup_make_room(photo.len*4+512*1024,15000);e=add_image(reply,photo.buf,photo.len);}
         if(e==ESP_OK)cleanup_queue(photo.buf,photo.len,photo.width,photo.height); // jpegはここで渡す。last_photoはこのファイルのまま
         else free(photo.buf);
     }

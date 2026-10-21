@@ -16,6 +16,11 @@ static void cleanup_make_room(size_t need,unsigned timeout_ms){
     int64_t end=esp_timer_get_time()+timeout_ms*1000LL;
     while(cleanup_pending&&esp_timer_get_time()<end&&(!need||heap_caps_get_free_size(MALLOC_CAP_SPIRAM)<need))vTaskDelay(pdMS_TO_TICKS(50));
 }
+// 縞除去待ちがlimit枚未満になるまで待つ。タイムアウトあり
+static void cleanup_wait_backlog(unsigned limit,unsigned timeout_ms){
+    int64_t end=esp_timer_get_time()+timeout_ms*1000LL;
+    while(cleanup_pending>=limit&&esp_timer_get_time()<end)vTaskDelay(pdMS_TO_TICKS(50));
+}
 static esp_err_t cleanup_replace(const cleanup_job *job,const uint8_t *data,size_t len){
     char cleaned[112],original[112];size_t n=strlen(job->path);
     if(n<4||strcmp(job->path+n-4,".JPG"))return ESP_ERR_INVALID_ARG;
