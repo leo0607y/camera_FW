@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#09090b">
+<meta name="format-detection" content="telephone=no">
+<title>Camera ライブラリ</title>
+<style>
+:root{
+ --bg:#09090b;--surface:#131316;--surface-2:#1c1c21;--raise:#26262c;--text:#f4f4f5;--muted:#8a8a94;--faint:#5a5a63;--line:#ffffff14;--line-2:#ffffff24;
+ --accent:#d6ff3f;--accent-text:#0b0b0c;--accent-soft:#d6ff3f1f;--ok:#3ddc84;--bad:#ff5a5f;--tile:#16161a;--shadow:0 24px 60px #000c;
+ --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+ --top:env(safe-area-inset-top,0px);--bottom:env(safe-area-inset-bottom,0px);
+ color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP","Segoe UI",sans-serif;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+[hidden]{display:none!important}
+html{background:var(--bg)}
+body{margin:0;background:var(--bg);color:var(--text);font-size:15px;line-height:1.5;-webkit-text-size-adjust:100%;min-height:100dvh;-webkit-font-smoothing:antialiased}
+body.locked{overflow:hidden}
+button,a{font:inherit;color:inherit;touch-action:manipulation}
+button{border:0;background:none;padding:0;cursor:pointer}
+button:disabled{opacity:.35;cursor:default}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:8px}
+svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round;flex:none}
+
+/* Sticky top: connection, title, folders, type switch */
+.top{position:sticky;top:0;z-index:5;background:#09090bd9;-webkit-backdrop-filter:saturate(1.4) blur(20px);backdrop-filter:saturate(1.4) blur(20px);padding-top:var(--top);border-bottom:1px solid transparent;transition:border-color .2s}
+.top.scrolled{border-bottom-color:var(--line)}
+.bar{display:flex;align-items:center;gap:2px;padding:14px 8px 10px 16px;max-width:1100px;margin:auto}
+.brand{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.overline{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:10px;white-space:nowrap;overflow:hidden}
+h1{font-size:28px;font-weight:700;letter-spacing:-.03em;margin:0;line-height:1.15}
+.conn{display:inline-flex;align-items:center;gap:7px}
+.conn i{width:6px;height:6px;border-radius:50%;background:var(--faint)}
+.conn.ok{color:var(--text)}.conn.ok i{background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft),0 0 10px var(--accent)}
+.conn.bad{color:var(--bad)}.conn.bad i{background:var(--bad);box-shadow:0 0 8px var(--bad)}
+.icon-btn{width:42px;height:42px;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;color:var(--text);transition:background .15s}
+.icon-btn:active{background:var(--surface-2)}
+.bar .icon-btn{color:#d4d4d8}
+.spin svg{animation:spin .9s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.chips{display:flex;gap:6px;overflow-x:auto;padding:2px 16px 12px;max-width:1100px;margin:auto;scrollbar-width:none;scroll-padding:16px}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:none;height:32px;padding:0 13px;border-radius:99px;border:1px solid var(--line-2);font-size:13px;font-weight:600;color:#c4c4cc;white-space:nowrap;display:inline-flex;align-items:center;gap:7px;transition:background .15s,color .15s,border-color .15s}
+.chip[aria-pressed="true"]{background:var(--text);border-color:var(--text);color:var(--bg)}
+.chip small{font-family:var(--mono);font-size:9.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--accent)}
+.chip[aria-pressed="true"] small{color:var(--bg);opacity:.55}
+.seg-row{padding:0 16px 12px;max-width:1100px;margin:auto}
+.seg{display:grid;grid-template-columns:1fr 1fr;background:var(--surface);border:1px solid var(--line);border-radius:99px;padding:3px;position:relative}
+.seg button{height:34px;border-radius:99px;font-size:14px;font-weight:600;color:var(--muted);position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:7px;transition:color .2s}
+.seg button[aria-selected="true"]{color:var(--text)}
+.seg svg{width:17px;height:17px}
+.seg::before{content:"";position:absolute;top:3px;bottom:3px;left:3px;width:calc(50% - 3px);border-radius:99px;background:var(--raise);box-shadow:inset 0 0 0 1px var(--line-2);transition:transform .3s cubic-bezier(.3,.7,.3,1)}
+.seg.second::before{transform:translateX(100%)}
+
+/* Content */
+main{max-width:1100px;margin:auto;padding:0 0 calc(32px + var(--bottom))}
+.summary{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:2px 16px 10px;font-size:12px;color:var(--muted);min-height:38px}
+.summary b{color:var(--text);font-family:var(--mono);font-size:15px;font-weight:600;font-variant-numeric:tabular-nums;margin-right:2px}
+.tip{display:flex;gap:12px;align-items:flex-start;margin:0 12px 12px;padding:12px 6px 12px 14px;background:linear-gradient(135deg,var(--accent-soft),transparent 70%),var(--surface);border:1px solid var(--line);border-radius:16px;font-size:13px;line-height:1.65;color:#d4d4d8}
+.tip svg{color:var(--accent);margin-top:1px}
+.tip b{color:var(--text)}
+.tip p{margin:0;flex:1}.tip .icon-btn{width:32px;height:32px;margin-top:-4px}
+.tip .icon-btn svg{color:var(--muted);width:18px;height:18px;margin:0}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:2px}
+.grid.videos{grid-template-columns:1fr;gap:8px;padding:0 12px}
+@media(min-width:600px){.grid{grid-template-columns:repeat(4,1fr);gap:6px;padding:0 12px}.grid.videos{grid-template-columns:repeat(2,1fr)}}
+@media(min-width:900px){.grid{grid-template-columns:repeat(6,1fr)}.grid.videos{grid-template-columns:repeat(3,1fr)}}
+.tile{position:relative;aspect-ratio:1;overflow:hidden;background:var(--tile);display:block;width:100%}
+@media(min-width:600px){.tile{border-radius:10px}}
+.tile img{width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity .35s,transform .2s}
+.tile.ready img{opacity:1}
+.tile::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent 30%,#ffffff0d 50%,transparent 70%);background-size:250% 100%;animation:shimmer 1.6s infinite}
+.tile.ready::after,.tile.failed::after{display:none}
+@keyframes shimmer{from{background-position:120% 0}to{background-position:-120% 0}}
+.tile.failed::before{content:"読み込み失敗";position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--faint)}
+.tile:active img{opacity:.7}
+.num{position:absolute;left:0;right:0;bottom:0;padding:16px 7px 5px;font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.04em;color:#ffffffd9;background:linear-gradient(#0000,#0009);text-align:left;font-variant-numeric:tabular-nums;opacity:0;transition:opacity .35s;pointer-events:none}
+.tile.ready .num{opacity:1}
+.video{display:flex;align-items:center;gap:14px;padding:12px 14px 12px 12px;background:var(--surface);border:1px solid var(--line);border-radius:16px;text-align:left;width:100%;min-height:76px;transition:border-color .15s,background .15s}
+.video:active{background:var(--surface-2)}
+.video .ic{width:52px;height:52px;border-radius:12px;background:radial-gradient(circle at 30% 25%,#2c2c33,#16161a);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;color:var(--accent)}
+.video div{flex:1;min-width:0}.video strong{display:block;font-family:var(--mono);font-size:14px;font-weight:600;letter-spacing:.02em}.video span{font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--muted)}
+.video>svg{color:var(--faint);width:18px}
+.state{padding:64px 28px;text-align:center;color:var(--muted);font-size:14px;line-height:1.8}
+.state .badge{width:72px;height:72px;border-radius:22px;background:var(--surface);border:1px solid var(--line-2);display:flex;align-items:center;justify-content:center;margin:0 auto 18px;color:var(--accent);box-shadow:0 0 40px var(--accent-soft)}
+.state .badge svg{width:30px;height:30px}
+.state h2{font-size:19px;letter-spacing:-.01em;color:var(--text);margin:0 0 6px}
+.state ol{text-align:left;max-width:330px;margin:16px auto 22px;padding-left:22px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:50px;padding:0 22px;border-radius:99px;background:var(--surface-2);border:1px solid var(--line);font-size:15px;font-weight:650;text-decoration:none;transition:transform .1s,filter .15s}
+.btn svg{width:19px;height:19px}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-text)}
+.btn:active{transform:scale(.98);filter:brightness(.9)}
+.more{display:flex;justify-content:center;padding:22px 16px}
+.more .btn{width:100%;max-width:360px}
+footer{text-align:center;font-size:11.5px;color:var(--faint);padding:16px 16px 0}
+footer a{color:inherit;font-family:var(--mono);text-decoration:none;border-bottom:1px solid var(--line-2)}
+
+/* Full screen viewer */
+.viewer{position:fixed;inset:0;z-index:20;background:#000;color:#fff;display:flex;flex-direction:column;opacity:0;transition:opacity .2s}
+.viewer.open{opacity:1}
+.vbar{display:flex;align-items:center;gap:6px;padding:calc(6px + var(--top)) 6px 6px;background:linear-gradient(#000d,#0000);position:absolute;left:0;right:0;top:0;z-index:2;transition:opacity .2s}
+.vbar .icon-btn{color:#fff}.vbar .icon-btn:active{background:#ffffff26}
+.vtitle{flex:1;min-width:0;text-align:center;font-family:var(--mono);font-size:13px;font-weight:600;letter-spacing:.04em;line-height:1.35}
+.vtitle small{display:block;font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;font-size:11px;font-weight:500;letter-spacing:0;color:#ffffff8c;font-variant-numeric:tabular-nums}
+.stage{flex:1;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;touch-action:pan-y pinch-zoom}
+#large{max-width:100%;max-height:100%;object-fit:contain;display:block;-webkit-touch-callout:default;-webkit-user-select:auto;user-select:auto;transition:transform .22s cubic-bezier(.3,.7,.3,1),opacity .2s}
+#large.dragging{transition:none}
+#large.loading{opacity:.25}
+.loader{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;font-size:12px;color:#ffffff99;pointer-events:none}
+.loader i{width:28px;height:28px;border:2px solid #ffffff26;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+.nav{position:absolute;top:50%;transform:translateY(-50%);width:48px;height:48px;border-radius:50%;background:#ffffff14;border:1px solid #ffffff1f;-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);color:#fff;display:none;align-items:center;justify-content:center;z-index:2}
+.nav.prev{left:14px}.nav.next{right:14px}
+@media(hover:hover) and (pointer:fine){.nav{display:flex}}
+.vfoot{position:absolute;left:0;right:0;bottom:0;z-index:2;padding:32px 16px calc(14px + var(--bottom));background:linear-gradient(#0000,#000e 40%);transition:opacity .2s}
+.looks{display:flex;gap:2px;margin:0 auto 14px;padding:3px;width:max-content;max-width:100%;overflow-x:auto;scrollbar-width:none;background:#ffffff12;border:1px solid #ffffff1a;border-radius:99px;-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px)}
+.looks button{flex:none;height:30px;padding:0 14px;border-radius:99px;color:#ffffffb3;font-size:12.5px;font-weight:600;transition:background .15s,color .15s}
+.looks button[aria-pressed="true"]{background:var(--accent);color:var(--accent-text)}
+.hint{display:flex;align-items:center;justify-content:center;gap:8px;font-size:12.5px;color:#ffffffb3;margin:0 0 12px;text-align:center}
+.hint svg{width:17px;height:17px}
+.vactions{display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:520px;margin:auto}
+.vactions .btn{background:#ffffff17;border-color:#ffffff1f;color:#fff;font-size:14px;padding:0 12px;-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px)}
+.vactions .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-text)}
+.viewer.bare .vbar,.viewer.bare .vfoot,.viewer.bare .nav{opacity:0;pointer-events:none}
+
+/* Bottom sheet */
+.sheet-wrap{position:fixed;inset:0;z-index:30;background:#0000;transition:background .25s;display:flex;align-items:flex-end;justify-content:center}
+.sheet-wrap.open{background:#000b}
+.sheet{background:var(--surface);color:var(--text);width:100%;max-width:560px;max-height:88dvh;overflow:auto;border:1px solid var(--line);border-bottom:0;border-radius:26px 26px 0 0;padding:8px 20px calc(20px + var(--bottom));transform:translateY(100%);transition:transform .32s cubic-bezier(.3,.7,.3,1);box-shadow:var(--shadow)}
+.sheet-wrap.open .sheet{transform:none}
+@media(min-width:600px){.sheet-wrap{align-items:center}.sheet{border-radius:26px;border-bottom:1px solid var(--line);padding-bottom:20px}}
+.grab{width:36px;height:4px;border-radius:2px;background:var(--line-2);margin:0 auto 12px}
+.sheet h2{font-size:20px;letter-spacing:-.02em;margin:4px 0 8px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.sheet h2 .icon-btn{background:var(--surface-2);width:34px;height:34px}.sheet h2 .icon-btn svg{width:17px;height:17px;color:var(--muted)}
+.sheet h3{font-size:12px;font-weight:700;letter-spacing:.06em;color:var(--muted);margin:24px 0 8px;display:flex;align-items:center;gap:8px}
+.sheet h3 svg{width:16px;height:16px;color:var(--accent)}
+.sheet p,.sheet li{font-size:14px;color:#b4b4bc;line-height:1.75;margin:0}
+.sheet b{color:var(--text)}
+.sheet ol{margin:0;padding-left:20px}
+.sheet .btn{width:100%;margin-top:20px}
+.sheet .note{background:var(--surface-2);border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin-top:14px;font-size:13px}
+.kv{display:grid;grid-template-columns:auto 1fr;font-size:14px;margin:14px 0 0;border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.kv dt,.kv dd{padding:11px 14px;border-top:1px solid var(--line);margin:0}.kv dt:first-of-type,.kv dd:first-of-type{border-top:0}
+.kv dt{color:var(--muted);font-size:13px}.kv dd{font-variant-numeric:tabular-nums;text-align:right}
+.text-btn{min-height:30px;padding:0 13px;border-radius:99px;border:1px solid var(--line-2);font-size:12.5px;font-weight:650;color:var(--text)}
+.check{position:absolute;top:6px;right:6px;width:24px;height:24px;border-radius:50%;border:1.5px solid #fff;background:#0000004d;display:none;align-items:center;justify-content:center;color:var(--accent-text);box-shadow:0 1px 3px #0006}
+.check svg{width:14px;height:14px;stroke-width:3;opacity:0}
+.selecting .check{display:flex}
+.selected .check{background:var(--accent);border-color:var(--accent)}.selected .check svg{opacity:1}
+.grid .tile.selected img{opacity:.5;transform:scale(.88)}
+.grid .tile.selected{box-shadow:inset 0 0 0 2px var(--accent)}
+.video .check{position:static;border-color:var(--line-2);background:none;box-shadow:none}
+.video.selected{border-color:var(--accent);background:var(--accent-soft)}.video.selected .check{border-color:var(--accent);background:var(--accent)}
+.selecting .video>svg:last-of-type{display:none}
+.selbar{position:fixed;left:12px;right:12px;bottom:calc(12px + var(--bottom));z-index:6;display:flex;align-items:center;gap:10px;padding:7px;max-width:560px;margin:auto;background:#1c1c21eb;border:1px solid var(--line-2);border-radius:99px;-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);box-shadow:var(--shadow)}
+.selbar span{flex:1;text-align:center;font-size:13px;font-weight:650;font-variant-numeric:tabular-nums}
+.btn.danger{background:var(--bad);border-color:var(--bad);color:#fff}
+.btn.small{min-height:40px;padding:0 16px;font-size:14px}
+body.select-mode main{padding-bottom:calc(96px + var(--bottom))}
+.confirm-actions{display:grid;gap:10px;margin-top:20px}.confirm-actions .btn{margin:0}
+.mode-list{display:grid;gap:6px;margin-top:14px}
+.mode{display:grid;grid-template-columns:auto 1fr;gap:3px 14px;align-items:center;padding:13px 14px;background:var(--surface-2);border:1px solid var(--line);border-radius:16px}
+.mode.current{border-color:var(--accent);background:linear-gradient(135deg,var(--accent-soft),transparent 80%),var(--surface-2)}
+.bits{display:flex;gap:5px;grid-row:span 2;padding:7px 8px;border-radius:10px;background:var(--bg);border:1px solid var(--line)}
+.bits i{width:9px;height:9px;border-radius:50%;background:#2a2a30}
+.bits i.on{background:#ff9f1a;box-shadow:0 0 8px #ff9f1acc}
+.mode b{font-size:15px;display:flex;align-items:center}.mode b small{font-family:var(--mono);font-size:11px;color:var(--muted);font-weight:600;margin-right:8px;font-variant-numeric:tabular-nums}
+.mode p{font-size:13px;line-height:1.6}
+.mode em{font-style:normal;font-size:10px;font-weight:700;color:var(--accent-text);background:var(--accent);border-radius:99px;padding:2px 8px;margin-left:8px}
+.legend{display:grid;grid-template-columns:auto 1fr;gap:10px 12px;align-items:center;margin-top:10px;font-size:14px}
+.legend span{color:#b4b4bc;font-size:13px;line-height:1.5}
+.lamp{width:12px;height:12px;border-radius:50%;display:inline-block}
+.lamp.g{background:#3ddc84;box-shadow:0 0 10px #3ddc84aa}.lamp.r{background:#ff5a5f;box-shadow:0 0 10px #ff5a5faa}.lamp.off{background:#2a2a30;border:1px solid var(--line-2)}
+.lamp.slow{animation:blink 1s steps(1) infinite}.lamp.fast{animation:blink .25s steps(1) infinite}
+@keyframes blink{50%{opacity:.12}}
+.steps{counter-reset:s;list-style:none;padding:0!important}
+.steps li{counter-increment:s;position:relative;padding-left:34px;margin:8px 0}
+.steps li::before{content:counter(s,decimal-leading-zero);position:absolute;left:0;top:2px;font-family:var(--mono);font-size:11px;font-weight:700;color:var(--accent);letter-spacing:.04em}
+.toast{position:fixed;left:50%;bottom:calc(24px + var(--bottom));transform:translate(-50%,20px);background:#26262cf2;border:1px solid var(--line-2);color:var(--text);padding:11px 18px;border-radius:99px;font-size:13px;z-index:40;opacity:0;transition:.25s;pointer-events:none;max-width:calc(100% - 32px);text-align:center;-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);box-shadow:var(--shadow)}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+ <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></symbol>
+ <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M9.3 9.2a2.8 2.8 0 0 1 5.4 1c0 1.9-2.7 2.4-2.7 4"/><path d="M12 17.6h.01"/></symbol>
+ <symbol id="i-photo" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="2"/><path d="m21 16-5-5-9 9"/></symbol>
+ <symbol id="i-video" viewBox="0 0 24 24"><rect x="2.5" y="6" width="13" height="12" rx="2.5"/><path d="m15.5 10.5 6-3.5v10l-6-3.5"/></symbol>
+ <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+ <symbol id="i-left" viewBox="0 0 24 24"><path d="m15 5-7 7 7 7"/></symbol>
+ <symbol id="i-right" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+ <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 4v11m-5-5 5 5 5-5M5 20h14"/></symbol>
+ <symbol id="i-open" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/></symbol>
+ <symbol id="i-hand" viewBox="0 0 24 24"><path d="M9 11V5.5a1.5 1.5 0 0 1 3 0V11m0-1.5a1.5 1.5 0 0 1 3 0V12m0-1a1.5 1.5 0 0 1 3 0v4a6 6 0 0 1-6 6h-.6a6 6 0 0 1-4.6-2.2L4.5 15a1.6 1.6 0 0 1 2.4-2.1L9 15"/></symbol>
+ <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M2 8.8a15 15 0 0 1 20 0M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0M12 19.5h.01"/></symbol>
+ <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></symbol>
+ <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+ <symbol id="i-modes" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"/></symbol>
+ <symbol id="i-empty" viewBox="0 0 24 24"><path d="M4 7h3l1.5-2h7L17 7h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1z"/><circle cx="12" cy="12.5" r="3.5"/></symbol>
+</svg>
+
+<header class="top" id="top">
+ <div class="bar">
+  <div class="brand"><span class="overline"><span class="conn" id="conn"><i></i><span>確認中</span></span><span>192.168.4.1</span></span><h1>ライブラリ</h1></div>
+  <button class="icon-btn" id="refresh" aria-label="再読み込み"><svg><use href="#i-refresh"/></svg></button>
+  <button class="icon-btn" id="modes" aria-label="撮影モードとLEDの見方"><svg><use href="#i-modes"/></svg></button>
+  <button class="icon-btn" id="help" aria-label="使い方と保存方法"><svg><use href="#i-help"/></svg></button>
+ </div>
+ <nav class="chips" id="albums" aria-label="撮影フォルダ"></nav>
+ <div class="seg-row"><div class="seg" id="seg" role="tablist" aria-label="ファイルの種類">
+  <button id="photos" role="tab" aria-selected="true"><svg><use href="#i-photo"/></svg>写真</button>
+  <button id="videos" role="tab" aria-selected="false"><svg><use href="#i-video"/></svg>動画</button>
+ </div></div>
+</header>
+
+<main>
+ <div class="summary"><span id="status" role="status" aria-live="polite">読み込み中…</span><button class="text-btn" id="select" hidden>選択</button></div>
+ <div class="tip" id="tip" hidden><svg><use href="#i-hand"/></svg><p>写真をタップして拡大し、<b>長押し →「写真に保存」</b>でiPhoneの写真アプリに入ります。</p><button class="icon-btn" id="tip-close" aria-label="ヒントを閉じる"><svg><use href="#i-close"/></svg></button></div>
+ <div id="grid" class="grid"></div>
+ <div id="state" class="state" hidden></div>
+ <div class="more" id="more-row" hidden><button class="btn" id="more">さらに表示</button></div>
+ <div id="sentinel" style="height:1px"></div>
+ <footer>カメラ内の画像を表示しています · <a href="http://192.168.4.1/">192.168.4.1</a></footer>
+</main>
+
+<div class="viewer" id="viewer" role="dialog" aria-modal="true" aria-label="写真ビューア" hidden>
+ <div class="vbar">
+  <button class="icon-btn" id="v-close" aria-label="閉じる"><svg><use href="#i-close"/></svg></button>
+  <div class="vtitle"><span id="v-name"></span><small id="v-meta"></small></div>
+  <button class="icon-btn" id="v-delete" aria-label="この写真を削除"><svg><use href="#i-trash"/></svg></button>
+  <button class="icon-btn" id="v-info" aria-label="保存方法"><svg><use href="#i-help"/></svg></button>
+ </div>
+ <div class="stage" id="stage">
+  <img id="large" alt="">
+  <div class="loader" id="v-loader"><i></i><span>元の画像を読み込み中</span></div>
+  <button class="nav prev" id="v-prev" aria-label="前の写真"><svg><use href="#i-left"/></svg></button>
+  <button class="nav next" id="v-next" aria-label="次の写真"><svg><use href="#i-right"/></svg></button>
+ </div>
+ <div class="vfoot">
+  <div class="looks" id="looks" aria-label="加工"><button data-look="none" aria-pressed="true">元画像</button><button data-look="vivid" aria-pressed="false">鮮やか</button><button data-look="mono" aria-pressed="false">白黒</button><button data-look="sepia" aria-pressed="false">セピア</button></div>
+  <p class="hint" id="v-hint"><svg><use href="#i-hand"/></svg><span>写真を長押し →「写真に保存」</span></p>
+  <div class="vactions">
+   <a class="btn primary" id="v-open" target="_blank" rel="noopener"><svg><use href="#i-open"/></svg>画像だけを開く</a>
+   <a class="btn" id="v-save" download><svg><use href="#i-down"/></svg>ダウンロード</a>
+  </div>
+ </div>
+</div>
+
+<div class="sheet-wrap" id="help-sheet" hidden><div class="sheet" role="dialog" aria-modal="true" aria-labelledby="help-title">
+ <div class="grab"></div>
+ <h2 id="help-title">保存のしかた<button class="icon-btn" data-close aria-label="閉じる"><svg><use href="#i-close"/></svg></button></h2>
+ <h3><svg><use href="#i-photo"/></svg>iPhone（Safari）</h3>
+ <ol><li>写真をタップして拡大し、読み込みが終わるまで待ちます。</li><li>写真を長押しして「写真に保存」を選びます。</li><li>メニューが出ないときは「画像だけを開く」→ 共有ボタン →「画像を保存」。</li></ol>
+ <h3><svg><use href="#i-photo"/></svg>Android（Chrome）</h3>
+ <ol><li>写真を長押しして「画像をダウンロード」、または「ダウンロード」ボタン。</li></ol>
+ <h3><svg><use href="#i-video"/></svg>動画</h3>
+ <p>音声なしのAVI（MJPEG）です。「動画を保存」でファイルとして保存します。スマホの標準アプリでは再生できない場合があり、そのときはPCや対応アプリで再生してください。</p>
+ <h3><svg><use href="#i-wifi"/></svg>接続について</h3>
+ <p>カメラのWi-Fi（Camera-…）に接続している間だけ使えます。「インターネット未接続」と出ても接続を維持してください。保存中は電源とモードを変えず、終わったら元のWi-Fiへ戻してください。</p>
+ <p class="note">撮影モードやLEDの意味は、右上の「モードとLED」ボタンで確認できます。</p>
+ <p class="note">フォルダは日付ではなく「起動ごと」の連番です。同じ起動中の写真と動画が同じフォルダに入ります。</p>
+ <button class="btn primary" data-close>わかりました</button>
+</div></div>
+
+<div class="sheet-wrap" id="modes-sheet" hidden><div class="sheet" role="dialog" aria-modal="true" aria-labelledby="modes-title">
+ <div class="grab"></div>
+ <h2 id="modes-title">撮影モードとLED<button class="icon-btn" data-close aria-label="閉じる"><svg><use href="#i-close"/></svg></button></h2>
+ <p>オレンジの3つのLEDが、今のモード番号を表します（左から4・2・1）。</p>
+ <div class="mode-list" id="mode-list"></div>
+ <h3><svg><use href="#i-modes"/></svg>モードの変え方</h3>
+ <ol class="steps"><li>SW7を押すと選択が始まります（緑は消灯）。</li><li>RV1を回して、オレンジのLEDを目的の番号に合わせます。</li><li>もう一度SW7で確定。SW6を押すと取り消せます。</li><li>緑が点灯したら使えます。</li></ol>
+ <h3><span class="lamp g"></span>緑 Ready</h3>
+ <div class="legend">
+  <i class="lamp g"></i><span><b>点灯</b> 準備完了。SW6で撮影・録画開始（モード7はスマホから接続）</span>
+  <i class="lamp g slow"></i><span><b>ゆっくり点滅</b> 準備中・処理中。押さずに待つ</span>
+  <i class="lamp g fast"></i><span><b>速い点滅</b> 録画中・セルフタイマー中。SW6で停止</span>
+  <i class="lamp off"></i><span><b>消灯</b> モード選択中、または停止中（赤が点滅）</span>
+ </div>
+ <h3><span class="lamp r"></span>赤 Error</h3>
+ <div class="legend">
+  <i class="lamp r"></i><span><b>点灯</b> 直前の撮影・録画が失敗。次に成功すると消える</span>
+  <i class="lamp r slow"></i><span><b>点滅</b> 準備に失敗して停止中。SDなどを確認してSW6で再準備</span>
+ </div>
+ <p class="note">鮮やか・白黒・セピアはカメラのモードではなく、この画面で写真を拡大したときに選べる加工です。SDの元画像は変わりません。</p>
+ <button class="btn primary" data-close>閉じる</button>
+</div></div>
+
+<div class="sheet-wrap" id="video-sheet" hidden><div class="sheet" role="dialog" aria-modal="true" aria-labelledby="video-title">
+ <div class="grab"></div>
+ <h2 id="video-title"><span id="vs-name"></span><button class="icon-btn" data-close aria-label="閉じる"><svg><use href="#i-close"/></svg></button></h2>
+ <dl class="kv"><dt>形式</dt><dd>AVI（MJPEG・音声なし）</dd><dt>サイズ</dt><dd id="vs-size"></dd><dt>フォルダ</dt><dd id="vs-album"></dd></dl>
+ <p class="note">スマホの標準アプリでは再生できない場合があります。保存後、PCや対応アプリで再生してください。</p>
+ <a class="btn primary" id="vs-save" download><svg><use href="#i-down"/></svg>動画を保存</a>
+ <button class="btn" id="vs-delete" style="color:var(--bad)"><svg><use href="#i-trash"/></svg>この動画を削除</button>
+</div></div>
+
+<div class="selbar" id="selbar" hidden><button class="btn small" id="sel-all">すべて選択</button><span id="sel-count">0件を選択</span><button class="btn small danger" id="sel-delete" disabled><svg><use href="#i-trash"/></svg>削除</button></div>
+
+<div class="sheet-wrap" id="confirm-sheet" hidden><div class="sheet" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
+ <div class="grab"></div>
+ <h2 id="confirm-title"></h2>
+ <p>SDカードから完全に削除されます。元に戻すことはできません。</p>
+ <div class="confirm-actions"><button class="btn danger" id="confirm-yes"><svg><use href="#i-trash"/></svg>削除する</button><button class="btn" data-close>キャンセル</button></div>
+</div></div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+const $=id=>document.getElementById(id);
+const S={kind:'photo',album:'',before:100000,more:false,loading:false,gen:0,files:[],albumBefore:10000000,albumMore:false,albumIds:[],legacy:false,index:-1,selecting:false,selected:new Set(),videoFile:null};
+const size=b=>b>=1048576?(b/1048576).toFixed(1)+' MB':Math.round(b/1024)+' KB';
+const albumLabel=id=>id==='legacy'?'これまでの写真':'起動 '+String(Number(id.slice(1))).padStart(3,'0');
+const store={get(k){try{return localStorage.getItem(k)}catch(e){return null}},set(k,v){try{localStorage.setItem(k,v)}catch(e){}}};
+let toastTimer;
+function toast(text){const t=$('toast');t.textContent=text;t.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('show'),2400)}
+function connection(ok){const c=$('conn');c.className='conn '+(ok?'ok':'bad');c.lastChild.textContent=ok?'接続中':'未接続'}
+
+// The board serves at most 4 sockets, so thumbnails load a few at a time and yield to the viewer.
+const queue=[];let active=0;
+function pump(){
+ const limit=$('viewer').hidden?3:1;
+ while(active<limit&&queue.length){
+  const img=queue.shift();if(!img.isConnected)continue;active++;
+  const tile=img.parentNode,done=ok=>{active--;tile.classList.add(ok?'ready':'failed');pump()};
+  img.onload=()=>done(true);img.onerror=()=>done(false);img.src=img.dataset.src;
+ }
+}
+const seen='IntersectionObserver' in window?new IntersectionObserver(entries=>{for(const e of entries)if(e.isIntersecting){seen.unobserve(e.target);queue.push(e.target);}pump()},{rootMargin:'400px 0px'}):null;
+
+function valid(file){
+ const path=file.path||file.name;
+ return /^(IMG[0-9]{5}\.JPG|VID[0-9]{5}\.AVI)$/.test(file.name)&&/^(S[0-9]{7}\/)?(IMG[0-9]{5}\.JPG|VID[0-9]{5}\.AVI)$/.test(path);
+}
+function add(file){
+ const url='/file/'+(file.path||file.name);S.files.push(file);
+ const check='<span class="check"><svg><use href="#i-check"/></svg></span>';
+ if(S.kind==='photo'){
+  const tile=document.createElement('button');tile.className='tile';tile.setAttribute('aria-label',file.name+' を開く');
+  const img=new Image();img.alt='';img.decoding='async';img.dataset.src=url+'?inline=1';
+  const num=document.createElement('span');num.className='num';num.textContent=file.name.slice(3,8);
+  tile.append(img,num);tile.insertAdjacentHTML('beforeend',check);file.el=tile;
+  tile.onclick=()=>S.selecting?toggleSelected(file):openViewer(S.files.indexOf(file));$('grid').append(tile);
+  if(seen)seen.observe(img);else{queue.push(img);pump()}
+ }else{
+  const row=document.createElement('button');row.className='video';
+  row.innerHTML='<span class="ic"><svg><use href="#i-video"/></svg></span><div><strong></strong><span></span></div><svg><use href="#i-down"/></svg>'+check;file.el=row;
+  row.querySelector('strong').textContent=file.name;row.querySelector('div span').textContent='AVI · '+size(file.bytes);
+  row.onclick=()=>S.selecting?toggleSelected(file):openVideo(file);$('grid').append(row);
+ }
+}
+function showState(kind){
+ const st=$('state');
+ if(!kind){st.hidden=true;return}
+ st.hidden=false;
+ if(kind==='error')st.innerHTML='<div class="badge"><svg><use href="#i-wifi"/></svg></div><h2>カメラに接続できません</h2><ol><li>基板がモード7（スマホ転送）で、緑のReadyが点灯しているか確認</li><li>スマホのWi-Fi設定で「Camera-…」に接続</li><li>下のボタンで再読み込み</li></ol><button class="btn primary" id="retry"><svg><use href="#i-refresh"/></svg>再読み込み</button>';
+ else st.innerHTML='<div class="badge"><svg><use href="#i-empty"/></svg></div><h2>'+(S.kind==='photo'?'写真':'動画')+'はまだありません</h2><p>'+(S.kind==='photo'?'撮影モードでSW6を押して撮影してから、もう一度開いてください。':'動画モードで録画してから、もう一度開いてください。')+'</p>'+(S.albumIds.length>1||S.legacy?'<p>上のフォルダを切り替えると、ほかの起動の撮影を見られます。</p>':'');
+ const retry=$('retry');if(retry)retry.onclick=()=>init();
+}
+function updateSummary(){
+ const n=S.files.length,unit=S.kind==='photo'?'枚':'本';
+ $('status').innerHTML=n?'<b>'+n+'</b> '+unit+(S.more?' 以上':''):'';
+ $('select').hidden=!n;if(S.selecting)updateSelected();
+}
+async function load(reset=false){
+ if(S.loading&&!reset)return;S.loading=true;const gen=++S.gen;
+ if(reset){S.before=100000;S.files=[];queue.length=0;$('grid').replaceChildren();$('grid').className='grid'+(S.kind==='video'?' videos':'');showState(null);$('status').textContent='読み込み中…';$('select').hidden=true;setSelecting(false)}
+ $('refresh').classList.add('spin');$('more').disabled=true;$('more').textContent='読み込み中…';
+ try{
+  const r=await fetch('/api/files?kind='+S.kind+'&album='+encodeURIComponent(S.album)+'&before='+S.before,{cache:'no-store'});
+  if(!r.ok)throw Error(r.status);const data=await r.json();if(gen!==S.gen)return;
+  if(!Array.isArray(data.files))throw Error('list');
+  for(const f of data.files)if(valid(f))add(f);
+  S.before=data.before;S.more=!!data.more&&data.files.length>0;connection(true);
+  showState(S.files.length?null:'empty');updateSummary();
+ }catch(e){
+  if(gen!==S.gen)return;connection(false);
+  if(S.files.length)toast('読み込めませんでした。接続を確認してください。');else{showState('error');$('status').textContent=''}
+ }finally{
+  if(gen===S.gen){S.loading=false;$('refresh').classList.remove('spin');$('more').disabled=false;$('more').textContent='さらに表示';$('more-row').hidden=!S.more;$('tip').hidden=S.kind!=='photo'||!S.files.length||store.get('tip')==='0'}
+ }
+}
+
+function renderAlbums(){
+ const box=$('albums');box.replaceChildren();
+ const ids=[...S.albumIds];if(S.legacy)ids.push('legacy');
+ ids.forEach((id,i)=>{
+  const chip=document.createElement('button');chip.className='chip';chip.textContent=albumLabel(id);chip.setAttribute('aria-pressed',id===S.album);
+  if(i===0&&id!=='legacy'){const s=document.createElement('small');s.textContent='最新';chip.append(s)}
+  chip.onclick=()=>{if(S.album===id)return;S.album=id;renderAlbums();load(true)};box.append(chip);
+ });
+ if(S.albumMore){const more=document.createElement('button');more.className='chip';more.textContent='さらに古いフォルダ…';more.onclick=()=>albums(true).catch(()=>toast('フォルダを読み込めませんでした。'));box.append(more)}
+ box.hidden=ids.length<2&&!S.albumMore;
+ box.querySelector('[aria-pressed="true"]')?.scrollIntoView({block:'nearest',inline:'center'});
+}
+async function albums(append=false){
+ const r=await fetch('/api/albums?before='+(append?S.albumBefore:10000000),{cache:'no-store'});if(!r.ok)throw Error(r.status);
+ const data=await r.json(),ids=(data.albums||[]).filter(id=>/^S[0-9]{7}$/.test(id));
+ S.albumIds=append?S.albumIds.concat(ids):ids;S.legacy=!!data.legacy;S.albumBefore=data.before;S.albumMore=!!data.more;
+ if(!append&&!S.albumIds.includes(S.album)&&!(S.album==='legacy'&&S.legacy))S.album=S.albumIds[0]||'legacy';
+ renderAlbums();
+}
+async function init(){
+ $('refresh').classList.add('spin');
+ try{await albums();connection(true)}catch(e){S.album=S.album||'legacy';S.albumIds=[];S.legacy=false;renderAlbums()}
+ load(true);
+}
+function setKind(kind){
+ if(S.kind===kind)return;S.kind=kind;
+ $('photos').setAttribute('aria-selected',kind==='photo');$('videos').setAttribute('aria-selected',kind==='video');
+ $('seg').classList.toggle('second',kind==='video');load(true);
+}
+
+// Layers (viewer, sheets) push a history entry so the phone's back gesture closes them.
+const layers=[];
+function openLayer(el,onClose){
+ el.hidden=false;requestAnimationFrame(()=>requestAnimationFrame(()=>el.classList.add('open')));
+ layers.push({el,onClose});document.body.classList.add('locked');history.pushState({layer:layers.length},'');
+}
+function closeLayer(count=1){if(layers.length)history.go(-Math.min(count,layers.length))}
+addEventListener('popstate',()=>{
+ const depth=(history.state&&history.state.layer)||0;
+ while(layers.length>depth){
+  const top=layers.pop();top.el.classList.remove('open');
+  setTimeout(()=>{if(!top.el.classList.contains('open'))top.el.hidden=true},260);
+  if(top.onClose)top.onClose();
+ }
+ if(!layers.length)document.body.classList.remove('locked');
+});
+for(const wrap of document.querySelectorAll('.sheet-wrap')){
+ wrap.addEventListener('click',e=>{if(e.target===wrap||e.target.closest('[data-close]'))closeLayer()});
+}
+
+function showPhoto(i){
+ const file=S.files[i];if(!file)return;S.index=i;
+ const url='/file/'+(file.path||file.name),img=$('large');S.orig=url+'?inline=1';
+ $('v-name').textContent=file.name;$('v-meta').textContent=(i+1)+' / '+S.files.length+(S.more?'+':'')+' · '+size(file.bytes);
+ lookToken++;dropLook();lookLinks();
+ $('v-prev').disabled=i===0;$('v-next').disabled=i===S.files.length-1&&!S.more;
+ img.classList.add('loading');$('v-loader').hidden=false;$('v-loader').lastChild.textContent='元の画像を読み込み中';$('v-hint').hidden=true;
+ img.style.transform='';img.alt=file.name;img.src=url+'?inline=1';
+}
+// Color looks: re-encoded in the browser from the original; the JPEG on the SD card is never changed.
+let look='none',lookUrl=null,lookToken=0;
+function lookLinks(){
+ const file=S.files[S.index];if(!file)return;const shaded=look!=='none'&&lookUrl;
+ $('v-open').href=shaded?lookUrl:S.orig;$('v-save').href=shaded?lookUrl:'/file/'+(file.path||file.name);
+ $('v-save').download=shaded?file.name.replace('.JPG','_'+look+'.jpg'):file.name;
+ $('v-hint').lastChild.textContent=look==='none'?'写真を長押し →「写真に保存」':'加工した写真を長押し →「写真に保存」（SDの元画像はそのまま）';
+}
+function processLook(src,kind){
+ const c=document.createElement('canvas');c.width=src.naturalWidth;c.height=src.naturalHeight;
+ const x=c.getContext('2d');x.drawImage(src,0,0);const data=x.getImageData(0,0,c.width,c.height),p=data.data;
+ for(let i=0;i<p.length;i+=4){
+  let r=p[i],g=p[i+1],b=p[i+2];const l=.299*r+.587*g+.114*b;
+  if(kind==='vivid'){r=((l+(r-l)*1.35)-128)*1.08+128;g=((l+(g-l)*1.35)-128)*1.08+128;b=((l+(b-l)*1.35)-128)*1.08+128}
+  else if(kind==='mono'){r=g=b=(l-128)*1.05+128}
+  else{const R=.393*r+.769*g+.189*b,G=.349*r+.686*g+.168*b;b=.272*r+.534*g+.131*b;r=R;g=G}
+  p[i]=r;p[i+1]=g;p[i+2]=b; // Uint8ClampedArray clamps to 0..255.
+ }
+ x.putImageData(data,0,0);return new Promise(done=>c.toBlob(done,'image/jpeg',.92));
+}
+function dropLook(){if(lookUrl){URL.revokeObjectURL(lookUrl);lookUrl=null}}
+function applyLook(){
+ const img=$('large'),token=++lookToken;
+ $('v-loader').hidden=false;$('v-loader').querySelector('i').hidden=false;$('v-loader').lastChild.textContent='加工しています';img.classList.add('loading');
+ setTimeout(()=>processLook(img,look).then(blob=>{
+  if(token!==lookToken||!blob)return;dropLook();lookUrl=URL.createObjectURL(blob);img.src=lookUrl;lookLinks();
+ }),30);
+}
+function setLook(next){
+ look=next;for(const b of $('looks').children)b.setAttribute('aria-pressed',b.dataset.look===look);
+ const img=$('large');lookToken++;dropLook();lookLinks();
+ if(img.src.endsWith(S.orig)&&img.complete&&img.naturalWidth){if(look!=='none')applyLook()}else img.src=S.orig;
+}
+for(const b of $('looks').children)b.onclick=e=>{e.stopPropagation();setLook(b.dataset.look)};
+$('large').onload=()=>{const img=$('large');
+ if(look!=='none'&&!img.src.startsWith('blob:')){applyLook();return}
+ img.classList.remove('loading');$('v-loader').hidden=true;$('v-hint').hidden=false;$('v-meta').textContent=(S.index+1)+' / '+S.files.length+(S.more?'+':'')+' · '+img.naturalWidth+'×'+img.naturalHeight+' · '+size(S.files[S.index].bytes)};
+$('large').onerror=()=>{if(!$('large').getAttribute('src'))return;$('v-loader').lastChild.textContent='読み込めませんでした。Wi-Fi接続を確認してください。';$('v-loader').querySelector('i').hidden=true;connection(false)};
+function openViewer(i){$('v-loader').querySelector('i').hidden=false;$('viewer').classList.remove('bare');openLayer($('viewer'),()=>{lookToken++;dropLook();$('large').removeAttribute('src');S.index=-1;pump()});showPhoto(i)}
+async function step(d){
+ const i=S.index+d;if(i<0)return;
+ if(i>=S.files.length){if(!S.more)return;await load();if(i>=S.files.length)return}
+ $('v-loader').querySelector('i').hidden=false;showPhoto(i);
+}
+function openVideo(file){
+ $('vs-name').textContent=file.name;$('vs-size').textContent=size(file.bytes);$('vs-album').textContent=albumLabel(S.album);
+ $('vs-save').href='/file/'+(file.path||file.name);$('vs-save').download=file.name;S.videoFile=file;openLayer($('video-sheet'));
+}
+
+// Deletion: selection mode in the grid, plus single delete from the viewer and the video sheet.
+function setSelecting(on){
+ S.selecting=on;S.selected.clear();for(const f of S.files)f.el&&f.el.classList.remove('selected');
+ $('grid').classList.toggle('selecting',on);document.body.classList.toggle('select-mode',on);
+ $('selbar').hidden=!on;$('select').textContent=on?'キャンセル':'選択';updateSelected();
+}
+function toggleSelected(file){
+ if(S.selected.has(file))S.selected.delete(file);else S.selected.add(file);
+ file.el.classList.toggle('selected',S.selected.has(file));updateSelected();
+}
+function updateSelected(){
+ const n=S.selected.size;$('sel-count').textContent=n+'件を選択';$('sel-delete').disabled=!n;
+ $('sel-all').textContent=n&&n===S.files.length?'選択解除':'すべて選択';
+}
+let pending=null;
+function askDelete(files,after){
+ $('confirm-title').textContent=files.length===1?files[0].name+' を削除しますか？':files.length+'件を削除しますか？';
+ $('confirm-yes').disabled=false;$('confirm-yes').lastChild.textContent='削除する';pending={files,after};openLayer($('confirm-sheet'));
+}
+async function removeFiles(files){
+ let removed=0,failed=0;
+ for(const f of files){
+  $('confirm-yes').lastChild.textContent='削除中 '+(removed+failed+1)+' / '+files.length;
+  try{
+   const r=await fetch('/api/delete?path='+(f.path||f.name),{method:'POST',headers:{'X-Camera-Action':'delete'},cache:'no-store'});
+   if(!r.ok&&r.status!==404)throw Error(r.status);
+   const i=S.files.indexOf(f);if(i>=0)S.files.splice(i,1);if(f.el)f.el.remove();S.selected.delete(f);removed++;
+  }catch(e){failed++}
+ }
+ updateSummary();
+ if(!S.files.length&&!S.more){showState('empty');const before=S.album;try{await albums();if(S.album!==before)load(true)}catch(e){}}
+ toast(failed?removed+'件を削除、'+failed+'件は削除できませんでした。':removed+'件を削除しました。');
+ return removed;
+}
+$('confirm-yes').onclick=async()=>{
+ if(!pending)return;const {files,after}=pending;pending=null;$('confirm-yes').disabled=true;
+ after(await removeFiles(files));
+};
+$('select').onclick=()=>setSelecting(!S.selecting);
+$('sel-all').onclick=()=>{const all=S.selected.size!==S.files.length;S.selected.clear();for(const f of S.files){if(all)S.selected.add(f);f.el.classList.toggle('selected',all)}updateSelected()};
+$('sel-delete').onclick=()=>askDelete([...S.selected],()=>{closeLayer();setSelecting(false)});
+$('v-delete').onclick=()=>{
+ const i=S.index,f=S.files[i];if(!f)return;
+ askDelete([f],removed=>{if(!removed)closeLayer();else if(!S.files.length)closeLayer(2);else{closeLayer();showPhoto(Math.min(i,S.files.length-1))}});
+};
+$('vs-delete').onclick=()=>{if(S.videoFile)askDelete([S.videoFile],removed=>closeLayer(removed?2:1))};
+
+// Swipe left/right to change photo, down to close; tap toggles the controls. Long-press is left to the browser.
+(()=>{
+ const stage=$('stage'),img=$('large');let x0=0,y0=0,dx=0,dy=0,touching=false,moved=false;
+ stage.addEventListener('touchstart',e=>{if(e.touches.length!==1||(visualViewport&&visualViewport.scale>1.05)){touching=false;return}touching=true;moved=false;x0=e.touches[0].clientX;y0=e.touches[0].clientY;dx=dy=0;img.classList.add('dragging')},{passive:true});
+ stage.addEventListener('touchmove',e=>{if(!touching)return;if(e.touches.length!==1){touching=false;img.style.transform='';return}dx=e.touches[0].clientX-x0;dy=e.touches[0].clientY-y0;if(Math.abs(dx)>8||Math.abs(dy)>8)moved=true;
+  if(Math.abs(dx)>Math.abs(dy))img.style.transform='translateX('+dx+'px)';else if(dy>0)img.style.transform='translateY('+dy+'px) scale('+Math.max(.85,1-dy/1200)+')'},{passive:true});
+ stage.addEventListener('touchend',()=>{if(!touching)return;touching=false;img.classList.remove('dragging');
+  if(Math.abs(dx)>60&&Math.abs(dx)>Math.abs(dy)){const d=dx<0?1:-1,i=S.index+d;if(i>=0&&(i<S.files.length||S.more)){img.style.transform='translateX('+(dx<0?-40:40)+'vw)';setTimeout(()=>step(d),120);return}}
+  else if(dy>110&&dy>Math.abs(dx)){closeLayer();return}
+  img.style.transform=''});
+ stage.addEventListener('click',e=>{if(moved){moved=false;return}if(e.target.closest('.nav'))return;$('viewer').classList.toggle('bare')});
+})();
+
+addEventListener('keydown',e=>{
+ if($('viewer').hidden||!$('viewer').classList.contains('open'))return;
+ if(e.key==='ArrowRight')step(1);else if(e.key==='ArrowLeft')step(-1);else if(e.key==='Escape')closeLayer();
+});
+$('v-prev').onclick=()=>step(-1);$('v-next').onclick=()=>step(1);$('v-close').onclick=closeLayer;
+// Mirrors camera_modes.h; mode 7 is the one serving this page.
+const MODES=[
+ ['標準','1600×1200。ふだんの撮影に。SW6で1枚撮影'],
+ ['高精細','1600×1200。圧縮を弱めて細部を残す（ファイルは大きめ）'],
+ ['連写','SW6で5枚を連続で撮影し、順にSDへ保存'],
+ ['セルフタイマー','SW6から10秒後に撮影。待機中は緑が速く点滅、SW6で中止'],
+ ['タイムラプス','2秒ごとに1コマの動画（20倍速で再生）。SW6で開始・停止、最大60分'],
+ ['暗所','800×600。増幅を強めて暗い場所でも明るく（ノイズ・ぶれは増える）'],
+ ['動画','640×480の音声なし動画。SW6で開始・停止、最大5分'],
+ ['スマホ転送','このページを表示中のモード。写真の閲覧・保存・削除ができます（SW6は無効）']
+];
+function renderModes(){
+ const list=$('mode-list');if(list.children.length)return;
+ MODES.forEach(([name,text],n)=>{
+  const row=document.createElement('div');row.className='mode'+(n===7?' current':'');
+  row.innerHTML='<span class="bits" aria-label="LED '+n.toString(2).padStart(3,'0')+'">'+[4,2,1].map(b=>'<i class="'+(n&b?'on':'')+'"></i>').join('')+'</span><b><small>'+n+'</small></b><p></p>';
+  row.querySelector('b').append(name);if(n===7)row.querySelector('b').insertAdjacentHTML('beforeend','<em>いまここ</em>');
+  row.querySelector('p').textContent=text;list.append(row);
+ });
+}
+$('modes').onclick=()=>{renderModes();openLayer($('modes-sheet'))};
+$('v-info').onclick=()=>openLayer($('help-sheet'));$('help').onclick=()=>openLayer($('help-sheet'));
+$('photos').onclick=()=>setKind('photo');$('videos').onclick=()=>setKind('video');
+$('refresh').onclick=()=>init();$('more').onclick=()=>load();
+$('tip-close').onclick=()=>{$('tip').hidden=true;store.set('tip','0')};
+addEventListener('scroll',()=>$('top').classList.toggle('scrolled',scrollY>4),{passive:true});
+if('IntersectionObserver' in window)new IntersectionObserver(e=>{if(e[0].isIntersecting&&S.more&&!S.loading&&S.files.length)load()},{rootMargin:'600px 0px'}).observe($('sentinel'));
+init();
+</script>
+</body>
+</html>

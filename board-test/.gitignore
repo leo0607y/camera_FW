@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.log
+captures/
+backups/
+firmware/build/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.old

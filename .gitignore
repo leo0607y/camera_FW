@@ -1,0 +1,19 @@
+# OS / エディタ
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# ログ・バックアップ
+*.log
+*.zip
+*.bin
+backups/
+
+# Wi-Fiのパスワードが入っているので除外（config.cpp.example をコピーして使う）
+camera-main/src/config.cpp

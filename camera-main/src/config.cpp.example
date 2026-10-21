@@ -1,0 +1,10 @@
+// config.cpp にコピーして、Wi-Fiの情報を書き換えて使う
+#include "config.h"
+
+// Wi-Fi設定の実体
+const char *WIFI_SSID = "YOUR_SSID";
+const char *WIFI_PASSWORD = "YOUR_PASSWORD";
+
+// デバイス設定の実体
+const char *DEVICE_NAME = "ESP32-S3";
+const char *DEVICE_VERSION = "1.0.0";

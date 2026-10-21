@@ -1,0 +1,82 @@
+# camera
+
+ESP32-S3 + OV2640 で作っている小型カメラ。
+
+## フォルダ
+
+- `board-test/` … 今の基板用。ESP-IDFのファームとPCのGUI。普段はこれを使う → [board-test/README.md](board-test/README.md)
+- `Dev/` … camera-main の改良版（PlatformIO）。保存まわりの修正、スマホからのWi-Fi設定、WebDAVへの自動バックアップ → [Dev/README.md](Dev/README.md)
+- `camera-main/` … 元のコード。触らずに残している
+
+## 書き込み
+
+GUIを閉じてから、ここで
+
+```powershell
+./write-firmware.ps1            # COMは自動検出
+./write-firmware.ps1 -Port COM14
+```
+
+ESP-IDFの読み込み → ビルド → 書き込み → 照合 → 再起動 まで全部やる。`./run.ps1` でも同じ。
+
+## camera-main のメモ
+
+元のコードを読んだときのメモ。実機では動かしていない。
+
+ボタンを押すとUXGA(1600x1200)のJPEGを撮ってSDに保存するだけのもの。Wi-Fiは使っていない。
+
+### 動き
+
+1. LEDを全部消して、ボタンを初期化
+2. SDとカメラを初期化
+3. 最初の5枚を捨てて露出が落ち着くのを待つ
+4. GPIO46のLEDが点いたら撮影待ち
+5. GPIO47を押すと、さらに5枚捨ててから1枚撮る
+6. SDに保存。そこから最低500ms待って次を受け付ける
+
+保存先はSDの直下で `1.jpg`, `2.jpg`, ... という名前。
+
+### ボタン・LED
+
+| GPIO | 役割 |
+| --- | --- |
+| 47 (ボタン) | 撮影。エラー中は1回目でエラー解除だけ（撮らない） |
+| 48 (ボタン) | 初期化だけで何もしない |
+| 46 (LED) | 撮影できる状態で点灯、撮影中は消灯 |
+| 38 (LED) | 撮影・保存に失敗すると点灯 |
+| 1 / 21 / 45 (LED) | 起動時に消すだけ |
+
+初期化に失敗していてもGPIO46が点くことがある。
+
+### Wi-Fi / Web
+
+Wi-Fi接続、LED操作ページ、写真を返す処理のコードはあるけど、`main.cpp` から呼ばれていないので動かない。写真を返す処理も保存後に解放したバッファを見ているので、有効にするだけでは使えない。「Camera Stream」という名前だが中身は静止画を1秒ごとに取り直すだけ。
+
+### ファイル（`camera-main/` 以下）
+
+| ファイル | 中身 |
+| --- | --- |
+| `src/main.cpp` | 起動処理とループ |
+| `src/camera_control.cpp` | カメラ初期化、撮影、Web用の写真送信 |
+| `src/sd_card.cpp` | SD初期化、枚数カウント、保存 |
+| `src/led_control.cpp` | LED |
+| `src/wifi_manager.cpp` | Wi-Fi接続（未使用） |
+| `src/web_server.cpp` | LED操作ページ（未使用） |
+| `include/config.h` | ピン番号、画質、撮影間隔など |
+| `src/config.cpp` | Wi-Fi情報など。gitには入れていないので `config.cpp.example` をコピーして作る |
+| `platformio.ini` | ボード設定（`esp32s3box`）、COMポート |
+
+### ビルド
+
+1. VS Code + PlatformIO で `camera-main` を開く
+2. 配線が `include/config.h` と合っているか確認
+3. `platformio.ini` のポートを直す（`COM11` になっている）
+4. ビルドして書き込み。シリアルは 115200
+
+SDはSPIで CS=10, MOSI=11, SCLK=12, MISO=13。PSRAM前提。
+
+### 気になるところ
+
+- 次のファイル番号が「.jpgの枚数+1」なので、途中の写真を消すと既存のファイルと番号がかぶる（1,2,3 から 2 を消すと次は 3.jpg）
+- SDの初期化は起動時だけ。エラー解除してもSDは再初期化されないので、カードを挿し直したら再起動が必要
+- `src/config.cpp` にWi-Fiのパスワードが直書きされている
