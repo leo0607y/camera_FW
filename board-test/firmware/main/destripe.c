@@ -102,9 +102,20 @@ static void helper(void *arg){
     QueueHandle_t jobs=arg;pipeline *p;
     while(1)if(xQueueReceive(jobs,&p,portMAX_DELAY)==pdTRUE){help(p);xSemaphoreGive(p->done);}
 }
+static void *psram(size_t n){return heap_caps_malloc(n,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);}
+static void *fast(size_t n){return heap_caps_malloc(n,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);}
+// 作業領域はUXGA分を起動時に取ったままにする（PSRAM 4.2MB）。写真ごとに取っていたら、撮影のコピーやUSBの返信で
+// PSRAMが断片化して、空きが7MBあってもYUVの3.84MBが連続で取れずに失敗した（高精細100枚中2枚, 2026-10-21）
+#define MAX_WIDTH 1600
+#define MAX_HEIGHT 1200
+static uint8_t *work_yuv,*work_ring,*work_line;static float *work_seg,*work_offset;static void *work_pool;
 esp_err_t destripe_init(void){
     if(!(one_photo=xSemaphoreCreateMutex()))return ESP_ERR_NO_MEM;
     row_noise_levels(level);row_noise_inverse(level,inverse);
+    work_yuv=psram((size_t)MAX_WIDTH*MAX_HEIGHT*2);work_ring=psram((size_t)RGB_RING*MAX_WIDTH*3);
+    work_seg=psram((size_t)MAX_HEIGHT*ROW_NOISE_SEGMENTS*3*sizeof(float));work_offset=psram((size_t)MAX_HEIGHT*3*sizeof(float));
+    work_line=fast(MAX_WIDTH*3);work_pool=fast(DECODE_POOL);
+    if(!work_yuv||!work_ring||!work_seg||!work_offset||!work_line||!work_pool)return ESP_ERR_NO_MEM;
     for(int core=0;core<2;core++){
         helper_jobs[core]=xQueueCreate(1,sizeof(pipeline*));
         if(!helper_jobs[core]||xTaskCreatePinnedToCore(helper,"destripe",8192,helper_jobs[core],WORK_PRIORITY,&helpers[core],core)!=pdPASS)return ESP_ERR_NO_MEM;
@@ -128,8 +139,6 @@ static bool sink_write(void *arg,const void *data,int len){
     }
     memcpy(s->data+s->len,data,len);s->len+=len;return true;
 }
-static void *psram(size_t n){return heap_caps_malloc(n,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);}
-static void *fast(size_t n){return heap_caps_malloc(n,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);}
 static esp_err_t run(const uint8_t *jpeg,size_t len,unsigned width,unsigned height,int quality,int helper_core,
                      uint8_t **out,size_t *out_len,float *peak,unsigned ms[4]);
 esp_err_t destripe_jpeg(const uint8_t *jpeg,size_t len,unsigned width,unsigned height,int quality,int helper_core,
@@ -142,15 +151,14 @@ esp_err_t destripe_jpeg(const uint8_t *jpeg,size_t len,unsigned width,unsigned h
 }
 static esp_err_t run(const uint8_t *jpeg,size_t len,unsigned width,unsigned height,int quality,int helper_core,
                      uint8_t **out,size_t *out_len,float *peak,unsigned ms[4]){
-    if(width<ROW_NOISE_SEGMENTS*8||width%2||height<2*ROW_NOISE_RADIUS+2)return ESP_ERR_INVALID_SIZE;
+    if(width<ROW_NOISE_SEGMENTS*8||width%2||height<2*ROW_NOISE_RADIUS+2||width>MAX_WIDTH||height>MAX_HEIGHT)return ESP_ERR_INVALID_SIZE;
     int64_t start=esp_timer_get_time(),decoded_at=start;
-    pipeline p={.jpeg=jpeg,.len=len,.width=width,.height=height,.main_task=xTaskGetCurrentTaskHandle()};
-    p.yuv=psram((size_t)width*height*2);p.rgb_ring=psram((size_t)RGB_RING*width*3);
-    p.seg=psram((size_t)height*ROW_NOISE_SEGMENTS*3*sizeof(float));p.offset=psram((size_t)height*3*sizeof(float));
-    p.line=fast(width*3);
-    void *pool=malloc(DECODE_POOL);p.done=xSemaphoreCreateBinary();
-    jpeg_sink sink={.capacity=len*3/2};sink.data=psram(sink.capacity);
-    esp_err_t e=p.yuv&&p.rgb_ring&&p.seg&&p.offset&&p.line&&pool&&p.done&&sink.data?ESP_OK:ESP_ERR_NO_MEM;
+    pipeline p={.jpeg=jpeg,.len=len,.width=width,.height=height,.main_task=xTaskGetCurrentTaskHandle(),
+                .yuv=work_yuv,.rgb_ring=work_ring,.seg=work_seg,.offset=work_offset,.line=work_line};
+    void *pool=work_pool;p.done=xSemaphoreCreateBinary();
+    // 再圧縮は元の1.8倍くらいになる（高精細で290KB→520KB）。途中で伸ばすと断片化しやすいので最初から2倍取る
+    jpeg_sink sink={.capacity=len*2+65536};sink.data=psram(sink.capacity);
+    esp_err_t e=pool&&p.done&&sink.data?ESP_OK:ESP_ERR_NO_MEM;
     bool started=false;
     // 処理中は補助タスクと同じ優先度。カメラやUSBを邪魔しない
     UBaseType_t priority=uxTaskPriorityGet(NULL);vTaskPrioritySet(NULL,WORK_PRIORITY);
@@ -166,7 +174,6 @@ static esp_err_t run(const uint8_t *jpeg,size_t len,unsigned width,unsigned heig
         else if(get(&p.decoded)!=height)e=ESP_ERR_INVALID_SIZE;
         decoded_at=esp_timer_get_time();
     }
-    free(pool);
     if(e==ESP_OK&&!jpeg_write_rows(width,height,quality,corrected_row,&p,sink_write,&sink))e=ESP_FAIL;
     if(e!=ESP_OK&&started)stop(&p);
     if(started)xSemaphoreTake(p.done,portMAX_DELAY);
@@ -178,7 +185,6 @@ static esp_err_t run(const uint8_t *jpeg,size_t len,unsigned width,unsigned heig
         ms[2]=(end-(p.measured_at>decoded_at?p.measured_at:decoded_at))/1000;ms[3]=(end-start)/1000;
         *peak=p.peak;
     }
-    free(p.yuv);free(p.rgb_ring);free(p.seg);free(p.offset);free(p.line);
     if(p.done)vSemaphoreDelete(p.done);
     if(e==ESP_OK){*out=sink.data;*out_len=sink.len;}else free(sink.data);
     return e;

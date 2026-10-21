@@ -2,17 +2,19 @@
 #include <stdint.h>
 #include <stdbool.h>
 // 色加工はスマホとPCでやる。基板は撮影だけ
-typedef struct { const char *name; int size,quality,gain,saturation,contrast,effect; bool night,video,timelapse; unsigned burst,timer_s; } camera_mode;
+// clock_div: センサーのクロック分周(CLKRC)。高精細は1(半分)。品質8・UXGAだとJPEGが途中で切れる(NO-EOI)フレームが
+// 4枚に1枚出ていた。半分にするとフレームの間隔が延びて露光を長く取れ、ゲインとノイズが下がって0になった(2026-10-21)
+typedef struct { const char *name; int size,quality,gain,saturation,contrast,effect; bool night,video,timelapse; unsigned burst,timer_s,clock_div; } camera_mode;
 // sizeは sensor.h の framesize_t
 static const camera_mode camera_modes[8]={
-    {"Standard",FRAMESIZE_UXGA,12,0,0,0,0,false,false,false,0,0},
-    {"Fine",FRAMESIZE_UXGA,8,0,0,0,0,false,false,false,0,0},
-    {"Burst",FRAMESIZE_UXGA,12,0,0,0,0,false,false,false,5,0},
-    {"Self-timer",FRAMESIZE_UXGA,12,0,0,0,0,false,false,false,0,10},
-    {"Time-lapse",FRAMESIZE_UXGA,12,0,0,0,0,false,true,true,0,0},
-    {"Low light",FRAMESIZE_SVGA,12,2,0,0,0,true,false,false,0,0},
-    {"Video",FRAMESIZE_VGA,16,1,0,0,0,false,true,false,0,0},
-    {"Phone transfer",FRAMESIZE_SVGA,12,0,0,0,0,false,false,false,0,0}
+    {"Standard",FRAMESIZE_UXGA,12,0,0,0,0,false,false,false,0,0,0},
+    {"Fine",FRAMESIZE_UXGA,8,0,0,0,0,false,false,false,0,0,1},
+    {"Burst",FRAMESIZE_UXGA,12,0,0,0,0,false,false,false,5,0,0},
+    {"Self-timer",FRAMESIZE_UXGA,12,0,0,0,0,false,false,false,0,10,0},
+    {"Time-lapse",FRAMESIZE_UXGA,12,0,0,0,0,false,true,true,0,0,0},
+    {"Low light",FRAMESIZE_SVGA,12,2,0,0,0,true,false,false,0,0,0},
+    {"Video",FRAMESIZE_VGA,16,1,0,0,0,false,true,false,0,0,0},
+    {"Phone transfer",FRAMESIZE_SVGA,12,0,0,0,0,false,false,false,0,0,0}
 };
 // 実際のADC範囲0〜2048を8分割、ヒステリシスあり
 static inline unsigned mode_from_adc(unsigned raw,unsigned maximum,unsigned previous){

@@ -45,6 +45,7 @@ static unsigned camera_clock = 20000000;
 static int camera_profile;
 // 細かい景色でJPEGが受信バッファに入らないとフレームが来ない。そのときだけ品質の数字を上げる（モード切替・再準備で0に戻す）
 static int quality_boost;
+static unsigned last_frame_len;
 static int64_t camera_started;
 static const char *sd_stage = "not_tested";
 static int sd_errno;
@@ -82,6 +83,15 @@ static volatile unsigned record_frames,record_ms;
 static unsigned video_count;
 static char last_video[96];
 static uint32_t last_video_crc,last_video_bytes;
+// 下げた画質は、撮れた写真が元の画質でもバッファの半分に収まりそうなら戻す（1段で約1.35倍）
+static void quality_restore(size_t len){
+    if(!quality_boost||!camera_ready)return;
+    float unboosted=len;for(int b=0;b<quality_boost;b+=4)unboosted*=1.35f;
+    if(unboosted>CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE/2)return;
+    sensor_t *s=esp_camera_sensor_get();if(!s||s->set_quality(s,camera_modes[active_mode].quality))return;
+    dlog("quality restored to %d (photo %u bytes, ~%u at full quality)",camera_modes[active_mode].quality,(unsigned)len,(unsigned)unboosted);
+    quality_boost=0;
+}
 static void execute_request(cJSON *req);
 static bool submit(cJSON *req);
 static bool ap_is_running(void);
@@ -175,6 +185,8 @@ static esp_err_t apply_mode_settings(sensor_t *s,bool live){
     if(live&&(s->set_framesize(s,(framesize_t)m->size)||s->set_quality(s,m->quality+quality_boost)))return ESP_FAIL;
     if(gain_limit>=0&&s->set_gainceiling(s,(gainceiling_t)gain_limit))return ESP_FAIL;
     if(s->set_saturation(s,m->saturation)||s->set_contrast(s,m->contrast)||s->set_aec2(s,m->night?1:0)||s->set_brightness(s,m->night?1:0)||s->set_special_effect(s,m->effect))return ESP_FAIL;
+    // ドライバは解像度を変えるたびにCLKRCを0に戻すので最後に書く（診断用のプロファイルは触らない）
+    if(camera_profile==0&&s->set_reg(s,0x0111,0x3f,m->clock_div))return ESP_FAIL;
     return ESP_OK;
 }
 static esp_err_t camera_init(void) {
@@ -432,7 +444,7 @@ static esp_err_t sd_save(camera_fb_t *frame,cJSON *reply){
 }
 static camera_fb_t *settled_frame(bool startup,esp_err_t *error){
     quality_gate gate={0};int64_t started=esp_timer_get_time();unsigned invalid=0;
-    unsigned observed=0,boosts=0;
+    unsigned observed=0,boosts=0,missed=0;
     if(!startup){gate.previous=latest_quality;gate.has_previous=true;}
     const unsigned minimum=startup?4000:0,limit=startup?25000:10000;
     while((esp_timer_get_time()-started)/1000<limit+boosts*6000){
@@ -442,12 +454,16 @@ static camera_fb_t *settled_frame(bool startup,esp_err_t *error){
         // 1枚ごと。lenがバッファ(768KB)に近いと次は入らずに捨てられる
         if(frame)dlog("frame #%u %s len=%u %ux%u wait=%u ms",observed,startup?"warm":"shot",(unsigned)frame->len,frame->width,frame->height,ms_since(asked));
         else dlog("frame #%u NULL after %u ms (camera_ready=%d quality=%d)",observed,ms_since(asked),camera_ready,camera_modes[active_mode].quality+quality_boost);
-        if(!frame&&camera_ready&&quality_boost<16){ // フレームが来ない＝JPEGがバッファに入らない。圧縮を強めてやり直す
-            sensor_t *s=esp_camera_sensor_get();quality_boost+=4;boosts++;
+        if(frame){last_frame_len=frame->len;missed=0;}
+        // フレームが来ない。直前のJPEGがバッファの6割を超えていたら入りきらなかったので圧縮を強める。
+        // そうでなければNO-EOIなどの一時的な乱れ（高精細100枚で1回、直前は270KB）なので、2回続くまでは下げない
+        if(!frame&&camera_ready&&quality_boost<16&&(++missed>=2||last_frame_len>CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE*6/10)){
+            sensor_t *s=esp_camera_sensor_get();quality_boost+=4;boosts++;missed=0;
             if(s)s->set_quality(s,camera_modes[active_mode].quality+quality_boost);
-            dlog("quality boost -> %d (jpeg quality %d)",quality_boost,camera_modes[active_mode].quality+quality_boost);
+            dlog("quality boost -> %d (jpeg quality %d, last frame %u bytes)",quality_boost,camera_modes[active_mode].quality+quality_boost,last_frame_len);
             continue;
         }
+        if(!frame&&camera_ready&&quality_boost<16){boosts++;continue;} // 待ち時間だけ延ばしてもう1回
         unsigned before_decode=(esp_timer_get_time()-started)/1000;
         if(startup&&before_decode<2500&&frame&&frame->len>1024){
             warmed_frames=observed;warmup_ms=before_decode;
@@ -550,14 +566,14 @@ static void prepare_camera(void){
 }
 static esp_err_t take_photo(cJSON *reply){
     set_phase("metering",false,ESP_OK);esp_err_t e=ESP_OK;
-    dlog("photo start mode=%u quality=%d cleanup_pending=%u",active_mode,camera_modes[active_mode].quality+quality_boost,cleanup_pending);DLOG_HEAP("photo");
+    dlog("photo start mode=%u quality=%d clock_div=%u cleanup_pending=%u",active_mode,camera_modes[active_mode].quality+quality_boost,camera_modes[active_mode].clock_div,cleanup_pending);DLOG_HEAP("photo");
     if(!camera_ready||!sd_ready||!image_settled){
         dlog("photo refused: camera_ready=%d sd_ready=%d image_settled=%d",camera_ready,sd_ready,image_settled);return ESP_ERR_INVALID_STATE;
     }
     int64_t t0=esp_timer_get_time();
-    // 縞除去待ちは3枚まで（1枚6秒くらいかかるので、溜めるとPSRAMが尽きて返信が作れなくなる）
+    // 縞除去待ちは5枚まで（1枚10秒くらいかかる。作業領域は確保済みなので、待ちの写真のコピーと返信が残りに入ればいい）
     // 加えてフレームのコピー分を先に空ける（フレームは長く持てない）
-    cleanup_wait_backlog(3,30000);cleanup_make_room(1024*1024,15000);
+    cleanup_wait_backlog(5,30000);cleanup_make_room(1024*1024,15000);
     unsigned waited=ms_since(t0);if(waited>50){dlog("photo waited %u ms for cleanup (pending=%u)",waited,cleanup_pending);DLOG_HEAP("photo after wait");}
     // シャッターより前のフレームを捨てる
     int64_t t1=esp_timer_get_time();
@@ -568,7 +584,7 @@ static esp_err_t take_photo(cJSON *reply){
     if(frame){
         // すぐコピーする。数秒持っているとドライバに上書きされて下の方が壊れる
         camera_fb_t photo={.len=frame->len,.width=frame->width,.height=frame->height,.format=frame->format};
-        photo.buf=photo_copy(frame->buf,frame->len);esp_camera_fb_return(frame);
+        photo.buf=photo_copy(frame->buf,frame->len);esp_camera_fb_return(frame);quality_restore(photo.len);
         if(!photo.buf){DLOG_HEAP("photo: copy NO_MEM");return ESP_ERR_NO_MEM;}
         int64_t t2=esp_timer_get_time();
         e=sd_save(&photo,reply);
@@ -606,7 +622,7 @@ static esp_err_t take_burst(cJSON *reply,unsigned count){
         if(taken>=count)break;
         frame=esp_camera_fb_get();if(!frame)e=ESP_ERR_TIMEOUT;
     }
-    unsigned saved=0;
+    unsigned saved=0;if(taken)quality_restore(lengths[taken-1]);
     for(unsigned i=0;e==ESP_OK&&i<taken;i++){
         cJSON *target=i+1==taken?reply:cJSON_CreateObject();if(!target){e=ESP_ERR_NO_MEM;break;}
         camera_fb_t copy={.buf=copies[i],.len=lengths[i]};
@@ -823,8 +839,10 @@ void app_main(void){
     configASSERT(usb_mutex&&jobs&&sd_lock&&cleanup_jobs);
     ESP_ERROR_CHECK(destripe_init());
     configASSERT(xTaskCreatePinnedToCore(cleanup_worker,"cleanup",16384,NULL,1,NULL,1)==pdPASS);
-    configASSERT(xTaskCreate(camera_worker,"camera",20480,NULL,3,NULL)==pdPASS);
-    configASSERT(xTaskCreate(input_worker,"buttons",4096,NULL,4,NULL)==pdPASS);
+    // 撮影まわり（カメラドライバ・USBと同じ）はコア0、縞除去の展開と圧縮はコア1。
+    // 撮影処理がコア1に乗ると展開が止まり、続けて撮ると1.9秒→4秒に延びていた
+    configASSERT(xTaskCreatePinnedToCore(camera_worker,"camera",20480,NULL,3,NULL,0)==pdPASS);
+    configASSERT(xTaskCreatePinnedToCore(input_worker,"buttons",4096,NULL,4,NULL,0)==pdPASS);
     configASSERT(xTaskCreatePinnedToCore(dlog_sd_worker,"dlog_sd",4096,NULL,1,&dlog_task,0)==pdPASS);
     char line[256];size_t used=0;bool overflow=false;
     while(1){
