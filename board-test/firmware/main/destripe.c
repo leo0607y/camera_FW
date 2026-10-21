@@ -40,7 +40,7 @@ static inline void chroma(const uint8_t *a,const uint8_t *b,uint8_t *u,uint8_t *
 typedef struct {
     const uint8_t *jpeg;size_t len,read;unsigned width,height;
     uint8_t *yuv,*rgb_ring;
-    float *seg,*offset,*delta,*work;uint32_t *sums;uint16_t *lin_ring;uint8_t *line;
+    float *seg,*offset;uint8_t *line;
     unsigned decoded,produced,consumed;bool abort; // progress, accessed with atomics
     TaskHandle_t main_task,helper_task;SemaphoreHandle_t done;
     float peak;int64_t measured_at;
@@ -80,18 +80,17 @@ static void load_decoded_row(const void *image,unsigned y,uint8_t *line){
     WAIT_UNTIL(p,get(&p->decoded)>y);
     yuv_row(p,y,line);breathe(y);
 }
+static float level[256];static uint8_t inverse[4096]; // destripe_initで1回だけ作る（両コアで読むだけ）
 static void help(pipeline *p){
     uint16_t lin[256];row_noise_lut(lin);
-    row_noise_measure(load_decoded_row,p,p->width,p->height,lin,p->seg,p->sums,p->lin_ring,p->line,p->work);
+    row_noise_measure(load_decoded_row,p,p->width,p->height,lin,p->seg,p->line);
     if(!aborted(p)){
-        p->peak=row_noise_solve(p->seg,p->height,p->offset,p->delta);p->measured_at=esp_timer_get_time();
-        float level[256];uint8_t map[3][256];row_noise_levels(level);
+        p->peak=row_noise_solve(p->seg,p->width,p->height,p->offset);p->measured_at=esp_timer_get_time();
         for(unsigned y=0;y<p->height&&!aborted(p);y++){
             WAIT_UNTIL(p,y-get(&p->consumed)<RGB_RING);
             uint8_t *row=p->rgb_ring+(size_t)(y%RGB_RING)*p->width*3;
             yuv_row(p,y,row);
-            if(row_noise_row_map(p->offset,y,level,map))
-                for(unsigned x=0;x<p->width*3;x+=3){row[x]=map[0][row[x]];row[x+1]=map[1][row[x+1]];row[x+2]=map[2][row[x+2]];}
+            row_noise_correct_row(p->offset,y,p->width,p->height,level,inverse,row);
             put(&p->produced,y+1,p->main_task);breathe(y);
         }
     }
@@ -103,8 +102,20 @@ static void helper(void *arg){
     QueueHandle_t jobs=arg;pipeline *p;
     while(1)if(xQueueReceive(jobs,&p,portMAX_DELAY)==pdTRUE){help(p);xSemaphoreGive(p->done);}
 }
+static void *psram(size_t n){return heap_caps_malloc(n,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);}
+static void *fast(size_t n){return heap_caps_malloc(n,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);}
+// 作業領域はUXGA分を起動時に取ったままにする（PSRAM 4.2MB）。写真ごとに取っていたら、撮影のコピーやUSBの返信で
+// PSRAMが断片化して、空きが7MBあってもYUVの3.84MBが連続で取れずに失敗した（高精細100枚中2枚, 2026-10-21）
+#define MAX_WIDTH 1600
+#define MAX_HEIGHT 1200
+static uint8_t *work_yuv,*work_ring,*work_line;static float *work_seg,*work_offset;static void *work_pool;
 esp_err_t destripe_init(void){
     if(!(one_photo=xSemaphoreCreateMutex()))return ESP_ERR_NO_MEM;
+    row_noise_levels(level);row_noise_inverse(level,inverse);
+    work_yuv=psram((size_t)MAX_WIDTH*MAX_HEIGHT*2);work_ring=psram((size_t)RGB_RING*MAX_WIDTH*3);
+    work_seg=psram((size_t)MAX_HEIGHT*ROW_NOISE_SEGMENTS*3*sizeof(float));work_offset=psram((size_t)MAX_HEIGHT*3*sizeof(float));
+    work_line=fast(MAX_WIDTH*3);work_pool=fast(DECODE_POOL);
+    if(!work_yuv||!work_ring||!work_seg||!work_offset||!work_line||!work_pool)return ESP_ERR_NO_MEM;
     for(int core=0;core<2;core++){
         helper_jobs[core]=xQueueCreate(1,sizeof(pipeline*));
         if(!helper_jobs[core]||xTaskCreatePinnedToCore(helper,"destripe",8192,helper_jobs[core],WORK_PRIORITY,&helpers[core],core)!=pdPASS)return ESP_ERR_NO_MEM;
@@ -128,8 +139,6 @@ static bool sink_write(void *arg,const void *data,int len){
     }
     memcpy(s->data+s->len,data,len);s->len+=len;return true;
 }
-static void *psram(size_t n){return heap_caps_malloc(n,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);}
-static void *fast(size_t n){return heap_caps_malloc(n,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);}
 static esp_err_t run(const uint8_t *jpeg,size_t len,unsigned width,unsigned height,int quality,int helper_core,
                      uint8_t **out,size_t *out_len,float *peak,unsigned ms[4]);
 esp_err_t destripe_jpeg(const uint8_t *jpeg,size_t len,unsigned width,unsigned height,int quality,int helper_core,
@@ -142,17 +151,14 @@ esp_err_t destripe_jpeg(const uint8_t *jpeg,size_t len,unsigned width,unsigned h
 }
 static esp_err_t run(const uint8_t *jpeg,size_t len,unsigned width,unsigned height,int quality,int helper_core,
                      uint8_t **out,size_t *out_len,float *peak,unsigned ms[4]){
-    if(width<ROW_NOISE_SEGMENTS*8||width%2||height<2*ROW_NOISE_RADIUS+2)return ESP_ERR_INVALID_SIZE;
-    const size_t samples=(width/ROW_NOISE_STEP+1)*3;
+    if(width<ROW_NOISE_SEGMENTS*8||width%2||height<2*ROW_NOISE_RADIUS+2||width>MAX_WIDTH||height>MAX_HEIGHT)return ESP_ERR_INVALID_SIZE;
     int64_t start=esp_timer_get_time(),decoded_at=start;
-    pipeline p={.jpeg=jpeg,.len=len,.width=width,.height=height,.main_task=xTaskGetCurrentTaskHandle()};
-    p.yuv=psram((size_t)width*height*2);p.rgb_ring=psram((size_t)RGB_RING*width*3);
-    p.seg=psram((size_t)height*ROW_NOISE_SEGMENTS*3*sizeof(float));p.offset=psram((size_t)height*3*sizeof(float));
-    p.delta=malloc(height*sizeof(float));p.work=fast(width*sizeof(float));p.sums=malloc(samples*sizeof(uint32_t));
-    p.lin_ring=fast(ROW_NOISE_RING*samples*sizeof(uint16_t));p.line=fast(width*3);
-    void *pool=malloc(DECODE_POOL);p.done=xSemaphoreCreateBinary();
-    jpeg_sink sink={.capacity=len*3/2};sink.data=psram(sink.capacity);
-    esp_err_t e=p.yuv&&p.rgb_ring&&p.seg&&p.offset&&p.delta&&p.work&&p.sums&&p.lin_ring&&p.line&&pool&&p.done&&sink.data?ESP_OK:ESP_ERR_NO_MEM;
+    pipeline p={.jpeg=jpeg,.len=len,.width=width,.height=height,.main_task=xTaskGetCurrentTaskHandle(),
+                .yuv=work_yuv,.rgb_ring=work_ring,.seg=work_seg,.offset=work_offset,.line=work_line};
+    void *pool=work_pool;p.done=xSemaphoreCreateBinary();
+    // 再圧縮は元の1.8倍くらいになる（高精細で290KB→520KB）。途中で伸ばすと断片化しやすいので最初から2倍取る
+    jpeg_sink sink={.capacity=len*2+65536};sink.data=psram(sink.capacity);
+    esp_err_t e=pool&&p.done&&sink.data?ESP_OK:ESP_ERR_NO_MEM;
     bool started=false;
     // 処理中は補助タスクと同じ優先度。カメラやUSBを邪魔しない
     UBaseType_t priority=uxTaskPriorityGet(NULL);vTaskPrioritySet(NULL,WORK_PRIORITY);
@@ -168,7 +174,6 @@ static esp_err_t run(const uint8_t *jpeg,size_t len,unsigned width,unsigned heig
         else if(get(&p.decoded)!=height)e=ESP_ERR_INVALID_SIZE;
         decoded_at=esp_timer_get_time();
     }
-    free(pool);
     if(e==ESP_OK&&!jpeg_write_rows(width,height,quality,corrected_row,&p,sink_write,&sink))e=ESP_FAIL;
     if(e!=ESP_OK&&started)stop(&p);
     if(started)xSemaphoreTake(p.done,portMAX_DELAY);
@@ -180,7 +185,6 @@ static esp_err_t run(const uint8_t *jpeg,size_t len,unsigned width,unsigned heig
         ms[2]=(end-(p.measured_at>decoded_at?p.measured_at:decoded_at))/1000;ms[3]=(end-start)/1000;
         *peak=p.peak;
     }
-    free(p.yuv);free(p.rgb_ring);free(p.seg);free(p.offset);free(p.delta);free(p.work);free(p.sums);free(p.lin_ring);free(p.line);
     if(p.done)vSemaphoreDelete(p.done);
     if(e==ESP_OK){*out=sink.data;*out_len=sink.len;}else free(sink.data);
     return e;

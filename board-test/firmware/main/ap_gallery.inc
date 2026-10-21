@@ -144,7 +144,12 @@ static esp_err_t gallery_delete(httpd_req_t *req){
 static esp_err_t ap_gallery_stop(void){
     ap_running=false;esp_err_t e=ESP_OK;
     if(gallery_server){e=httpd_stop(gallery_server);gallery_server=NULL;}
-    if(gallery_wifi_initialized){esp_err_t stop=esp_wifi_stop();if(e==ESP_OK&&stop!=ESP_ERR_WIFI_NOT_STARTED)e=stop;}
+    // stopだけだとWi-Fiの内部RAMが残って縞除去がNO_MEMになるので、deinitまでして返す
+    if(gallery_wifi_initialized){
+        esp_err_t stop=esp_wifi_stop();if(e==ESP_OK&&stop!=ESP_ERR_WIFI_NOT_STARTED)e=stop;
+        esp_err_t deinit=esp_wifi_deinit();if(e==ESP_OK)e=deinit;
+        if(deinit==ESP_OK){esp_netif_destroy_default_wifi(gallery_netif);gallery_netif=NULL;gallery_wifi_initialized=false;}
+    }
     if(gallery_card){esp_err_t unmount=media_unmount(gallery_card);gallery_card=NULL;if(e==ESP_OK)e=unmount;}
     return e;
 }

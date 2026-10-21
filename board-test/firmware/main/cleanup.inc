@@ -16,6 +16,11 @@ static void cleanup_make_room(size_t need,unsigned timeout_ms){
     int64_t end=esp_timer_get_time()+timeout_ms*1000LL;
     while(cleanup_pending&&esp_timer_get_time()<end&&(!need||heap_caps_get_free_size(MALLOC_CAP_SPIRAM)<need))vTaskDelay(pdMS_TO_TICKS(50));
 }
+// 縞除去待ちがlimit枚未満になるまで待つ。タイムアウトあり
+static void cleanup_wait_backlog(unsigned limit,unsigned timeout_ms){
+    int64_t end=esp_timer_get_time()+timeout_ms*1000LL;
+    while(cleanup_pending>=limit&&esp_timer_get_time()<end)vTaskDelay(pdMS_TO_TICKS(50));
+}
 static esp_err_t cleanup_replace(const cleanup_job *job,const uint8_t *data,size_t len){
     char cleaned[112],original[112];size_t n=strlen(job->path);
     if(n<4||strcmp(job->path+n-4,".JPG"))return ESP_ERR_INVALID_ARG;
@@ -53,14 +58,18 @@ static void cleanup_worker(void *arg){
             portENTER_CRITICAL(&state_lock);go=!recording;if(go)cleanup_working=true;portEXIT_CRITICAL(&state_lock);
             if(!go)vTaskDelay(pdMS_TO_TICKS(200));
         }
-        int64_t started=esp_timer_get_time();uint8_t *cleaned=NULL;size_t len=0;float peak;unsigned ms[4];esp_err_t e;
-        for(int attempt=0;;attempt++){ // 連写やUSB転送でPSRAMが埋まっていることがあるのでしばらくリトライ
+        int64_t started=esp_timer_get_time();uint8_t *cleaned=NULL;size_t len=0;float peak=0;unsigned ms[4]={0};esp_err_t e;int attempt;
+        dlog("cleanup start %s len=%u quality=%d pending=%u (core %d + helper core 0)",job.path+7,(unsigned)job.len,job.quality,cleanup_pending,xPortGetCoreID());
+        for(attempt=0;;attempt++){ // 連写やUSB転送でPSRAMが埋まっていることがあるのでしばらくリトライ
             e=destripe_jpeg(job.jpeg,job.len,job.width,job.height,job.quality,0,&cleaned,&len,&peak,ms);
             if(e!=ESP_ERR_NO_MEM||attempt>=100)break;
+            if(attempt==0)DLOG_HEAP("cleanup NO_MEM, retrying");
             vTaskDelay(pdMS_TO_TICKS(300));
         }
         int64_t encoded=esp_timer_get_time();
-        if(e==ESP_OK)e=cleanup_replace(&job,cleaned,len);
+        dlog("cleanup destripe %s retries=%d decode=%u estimate=%u correct+encode=%u destripe=%u with_retries=%u ms out=%u peak=%.0f",
+             esp_err_to_name(e),attempt,ms[0],ms[1],ms[2],ms[3],(unsigned)((encoded-started)/1000),(unsigned)len,peak);
+        if(e==ESP_OK){e=cleanup_replace(&job,cleaned,len);dlog("cleanup replace %s %u ms",esp_err_to_name(e),(unsigned)((esp_timer_get_time()-encoded)/1000));}
         free(cleaned);free(job.jpeg);
         portENTER_CRITICAL(&state_lock);
         cleanup_pending--;if(e==ESP_OK)cleanup_done++;else cleanup_failed++;cleanup_last=e;cleanup_last_ms=(esp_timer_get_time()-started)/1000;

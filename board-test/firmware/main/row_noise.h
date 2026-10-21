@@ -5,9 +5,12 @@
 #include <string.h>
 // OV2640は一部の行に横幅全体のオフセットを足す（暗部の青・オレンジの縞）
 // トーンカーブの前に足されるので、リニアな光量で推定して引く
-// 行ごとに16区間の中央値の中央値を取り、区間がそろっているときだけ使う（本物の横線は残る）
-#define ROW_NOISE_RADIUS 6
+// 横16区間の平均を、上下48行(自分を含む97行)の中央値と比べる。縞は8行から数十行の帯になるので、
+// 平均と比べると帯の隣の行が逆向きに引っ張られる。中央値なら帯にも全幅の段差・なだらかな明暗にも引っ張られない
+// 区間の半分以上がそろってずれている行だけ補正する（半分より短い本物の横線は残る）
+#define ROW_NOISE_RADIUS 48
 #define ROW_NOISE_SEGMENTS 16
+#define ROW_NOISE_SUPPORT 8 // この数の区間が同じ向きにずれていないと補正しない
 #define ROW_NOISE_STEP 4 // pixel stride for the statistics (25 samples per segment at 1600 px)
 static inline float row_noise_median(float *v,unsigned n){
     unsigned lo=0,hi=n-1,k=n/2;
@@ -68,82 +71,76 @@ static inline float row_noise_linear(int v){
 static inline void row_noise_lut(uint16_t to_linear[256]){
     for(int i=0;i<256;i++)to_linear[i]=(uint16_t)(row_noise_linear(i)*4095.f+.5f);
 }
-#define ROW_NOISE_RING (2*ROW_NOISE_RADIUS+2)
-// rgb: width*height*3. seg: height*SEGMENTS*3. sums: (width/STEP+1)*3.
-// ring: RING*(width/STEP+1)*3 linear samples, line: width*3 bytes, work: width/SEGMENTS/STEP+1 (all fast RAM).
-// 各行は1回だけ読む
+// seg: height*SEGMENTS*3（区間ごとのリニア光量の平均）, line: width*3 bytes。各行は1回だけ読む
 typedef void (*row_noise_loader)(const void *image,unsigned y,uint8_t *line); // fills width*3 RGB bytes
-static inline void row_noise_measure(row_noise_loader load,const void *image,unsigned width,unsigned height,const uint16_t *lin,float *seg,
-                                     uint32_t *sums,uint16_t *ring,uint8_t *line,float *work){
-    const unsigned R=ROW_NOISE_RADIUS,span=width/ROW_NOISE_SEGMENTS,samples=(width/ROW_NOISE_STEP+1)*3;
-    for(unsigned i=0;i<samples;i++)sums[i]=0;
-    for(unsigned y=0;y<height+R;y++){
-        if(y<height){ // load row y into the ring and the window
-            uint16_t *slot=ring+(y%ROW_NOISE_RING)*samples;
-            load(image,y,line);
-            for(unsigned x=0,i=0;x<width;x+=ROW_NOISE_STEP,i+=3)for(unsigned c=0;c<3;c++){slot[i+c]=lin[line[x*3+c]];sums[i+c]+=slot[i+c];}
-        }
-        if(y<R)continue;
-        unsigned row=y-R; // the window now holds rows row-R..row+R
-        if(row>R){const uint16_t *old=ring+((row-R-1)%ROW_NOISE_RING)*samples;for(unsigned i=0;i<samples;i++)sums[i]-=old[i];}
-        unsigned lo=row>R?row-R:0,hi=row+R<height?row+R:height-1,count=hi-lo;
-        const uint16_t *cur=ring+(row%ROW_NOISE_RING)*samples;
-        for(unsigned c=0;c<3;c++)for(unsigned k=0;k<ROW_NOISE_SEGMENTS;k++){
-            unsigned n=0;
-            for(unsigned x=(k*span+ROW_NOISE_STEP-1)/ROW_NOISE_STEP*ROW_NOISE_STEP;x<(k+1)*span;x+=ROW_NOISE_STEP){
-                unsigned i=x/ROW_NOISE_STEP*3+c;float v=cur[i];work[n++]=v-(sums[i]-v)/count;
-            }
-            seg[((size_t)row*ROW_NOISE_SEGMENTS+k)*3+c]=row_noise_median(work,n);
+static inline void row_noise_measure(row_noise_loader load,const void *image,unsigned width,unsigned height,const uint16_t *lin,float *seg,uint8_t *line){
+    const unsigned span=width/ROW_NOISE_SEGMENTS;
+    for(unsigned y=0;y<height;y++){
+        load(image,y,line);
+        for(unsigned k=0;k<ROW_NOISE_SEGMENTS;k++){
+            uint32_t sum[3]={0};unsigned n=0;
+            for(unsigned x=(k*span+ROW_NOISE_STEP-1)/ROW_NOISE_STEP*ROW_NOISE_STEP;x<(k+1)*span;x+=ROW_NOISE_STEP,n++)
+                for(unsigned c=0;c<3;c++)sum[c]+=lin[line[x*3+c]];
+            for(unsigned c=0;c<3;c++)seg[((size_t)y*ROW_NOISE_SEGMENTS+k)*3+c]=(float)sum[c]/n;
         }
     }
 }
-// 補正は行全体に定数を足すだけなので、保存した区間の中央値だけで繰り返し詰められる
-static inline float row_noise_solve(const float *seg,unsigned height,float *offset /*height*3*/,float *delta /*height*/){
-    const unsigned R=ROW_NOISE_RADIUS;float shifted[ROW_NOISE_SEGMENTS],spread[ROW_NOISE_SEGMENTS],peak=0;
-    for(unsigned i=0;i<height*3;i++)offset[i]=0;
-    for(unsigned c=0;c<3;c++)for(int pass=0;pass<3;pass++){
-        for(unsigned y=0;y<height;y++){
-            unsigned lo=y>R?y-R:0,hi=y+R<height?y+R:height-1;float near=0;
-            for(unsigned j=lo;j<=hi;j++)if(j!=y)near+=offset[j*3+c];
-            float shift=offset[y*3+c]-near/(hi-lo);
-            for(unsigned k=0;k<ROW_NOISE_SEGMENTS;k++)shifted[k]=seg[((size_t)y*ROW_NOISE_SEGMENTS+k)*3+c]-shift;
-            for(unsigned k=0;k<ROW_NOISE_SEGMENTS;k++)spread[k]=shifted[k];
+// OV2640は縞が乗ったあとにレンズ補正（周辺ほどゲインを上げる）をかけるので、縞も周辺ほど強い（中央の2倍くらい）
+// 形は 1+GAIN*r^2（rは中心からの距離を横幅の半分で割ったもの）。この基板で実測(2026-10-21)。
+// レンズ補正(CTRL1 bit1)を切ると縞は横に平らになり、当てはめもGAIN=0になる
+#define ROW_NOISE_LENS_GAIN 1.7f
+#define ROW_NOISE_LENS_CX 0.55f // 180度回転したあとの画像での中心
+#define ROW_NOISE_LENS_CY 0.5f
+static inline float row_noise_lens_row(unsigned y,unsigned width,unsigned height){
+    float d=((float)y-ROW_NOISE_LENS_CY*height)/(width*.5f);return 1+ROW_NOISE_LENS_GAIN*d*d;
+}
+static inline float row_noise_lens(float x,unsigned y,unsigned width,unsigned height){
+    float d=(x-ROW_NOISE_LENS_CX*width)/(width*.5f);return row_noise_lens_row(y,width,height)+ROW_NOISE_LENS_GAIN*d*d;
+}
+// offset: height*3。行ごとの縞の量（レンズ補正のゲイン1のところでのリニア光量）。戻り値は最大の補正量
+static inline float row_noise_solve(const float *seg,unsigned width,unsigned height,float *offset){
+    const unsigned R=ROW_NOISE_RADIUS,span=width/ROW_NOISE_SEGMENTS;float window[2*ROW_NOISE_RADIUS+1],dev[ROW_NOISE_SEGMENTS],spread[ROW_NOISE_SEGMENTS],peak=0;
+    for(unsigned y=0;y<height;y++){
+        unsigned lo=y>R?y-R:0,hi=y+R<height?y+R:height-1;
+        for(unsigned c=0;c<3;c++){
+            for(unsigned k=0;k<ROW_NOISE_SEGMENTS;k++){
+                for(unsigned j=lo;j<=hi;j++)window[j-lo]=seg[((size_t)j*ROW_NOISE_SEGMENTS+k)*3+c];
+                dev[k]=(seg[((size_t)y*ROW_NOISE_SEGMENTS+k)*3+c]-row_noise_median(window,hi-lo+1))/row_noise_lens((k+.5f)*span,y,width,height);
+                spread[k]=dev[k];
+            }
             float o=row_noise_median(spread,ROW_NOISE_SEGMENTS);
-            for(unsigned k=0;k<ROW_NOISE_SEGMENTS;k++)spread[k]=fabsf(shifted[k]-o);
-            float conf=1-.7f*row_noise_median(spread,ROW_NOISE_SEGMENTS)/(fabsf(o)+1e-3f);
-            // センサーの縞は横幅全体。いくつかの区間が平らなら本物の線なので、4番目に弱い区間の分までしか補正しない
-            for(unsigned k=0;k<ROW_NOISE_SEGMENTS;k++){float a=shifted[k]*(o<0?-1:1);spread[k]=a<0?0:a;}
-            float support=0;for(int r=0;r<4;r++){unsigned m=0;for(unsigned k=1;k<ROW_NOISE_SEGMENTS;k++)if(spread[k]<spread[m])m=k;support=spread[m];spread[m]=INFINITY;}
+            // SUPPORT番目に弱い区間の分までしか補正しない。半分以上の区間が平らなら本物の線なので0になる
+            for(unsigned k=0;k<ROW_NOISE_SEGMENTS;k++){float a=dev[k]*(o<0?-1:1);spread[k]=a<0?0:a;}
+            float support=0;for(int r=0;r<ROW_NOISE_SUPPORT;r++){unsigned m=0;for(unsigned k=1;k<ROW_NOISE_SEGMENTS;k++)if(spread[k]<spread[m])m=k;support=spread[m];spread[m]=INFINITY;}
             float limited=fabsf(o)<support?o:copysignf(support,o);
-            delta[y]=limited*(conf<0?0:conf>1?1:conf);
+            offset[y*3+c]=limited;if(fabsf(limited)>peak)peak=fabsf(limited);
         }
-        for(unsigned y=0;y<height;y++)offset[y*3+c]+=delta[y];
     }
-    for(unsigned i=0;i<height*3;i++)if(fabsf(offset[i])>peak)peak=fabsf(offset[i]);
     return peak;
 }
-// 行ごとに256要素の表。補正なしの行はそのまま
-// 補正後のレベルはリニア光量で一番近いものを二分探索（powfを使わない）
+// 補正量が画素ごとに違うので、リニア光量(0..4095)から一番近いレベルを引く表を作っておく（powfを使わない）
 static inline void row_noise_levels(float level[256]){for(int v=0;v<256;v++)level[v]=row_noise_linear(v)*4095.f;}
-static inline bool row_noise_row_map(const float *offset,unsigned y,const float level[256],uint8_t map[3][256]){
-    bool any=false;
-    for(int c=0;c<3;c++){
-        float o=offset[y*3+c];bool on=fabsf(o)>=.25f;any|=on;
-        for(int v=0;v<256;v++){
-            if(!on){map[c][v]=v;continue;}
-            float target=level[v]-o;int lo=0,hi=255;
-            while(lo<hi){int mid=(lo+hi)/2;if(level[mid]<target)lo=mid+1;else hi=mid;}
-            if(lo>0&&target-level[lo-1]<level[lo]-target)lo--;
-            map[c][v]=lo;
-        }
+static inline void row_noise_inverse(const float level[256],uint8_t inverse[4096]){
+    for(int t=0;t<4096;t++){
+        int lo=0,hi=255;
+        while(lo<hi){int mid=(lo+hi)/2;if(level[mid]<t)lo=mid+1;else hi=mid;}
+        if(lo>0&&t-level[lo-1]<level[lo]-t)lo--;
+        inverse[t]=lo;
     }
-    return any;
+}
+// 1行(RGB)を補正する。補正量の小さい色はそのまま。どの色も補正しなければfalse
+static inline bool row_noise_correct_row(const float *offset,unsigned y,unsigned width,unsigned height,const float level[256],const uint8_t inverse[4096],uint8_t *row){
+    const float *o=offset+y*3;bool on[3];
+    for(int c=0;c<3;c++)on[c]=fabsf(o[c])>=.25f;
+    if(!on[0]&&!on[1]&&!on[2])return false;
+    const float base=row_noise_lens_row(y,width,height),cx=ROW_NOISE_LENS_CX*width,k=ROW_NOISE_LENS_GAIN/(width*.5f*width*.5f);
+    for(unsigned x=0;x<width;x++,row+=3){
+        float d=x-cx,g=base+k*d*d;
+        for(int c=0;c<3;c++)if(on[c]){int t=(int)(level[row[c]]-o[c]*g+.5f);row[c]=inverse[t<0?0:t>4095?4095:t];}
+    }
+    return true;
 }
 static inline void row_noise_apply(uint8_t *rgb,unsigned width,unsigned height,const float *offset){
-    float level[256];uint8_t map[3][256];row_noise_levels(level);
-    for(unsigned y=0;y<height;y++){
-        if(!row_noise_row_map(offset,y,level,map))continue;
-        uint8_t *row=rgb+(size_t)y*width*3;
-        for(unsigned x=0;x<width*3;x+=3){row[x]=map[0][row[x]];row[x+1]=map[1][row[x+1]];row[x+2]=map[2][row[x+2]];}
-    }
+    static float level[256];static uint8_t inverse[4096];row_noise_levels(level);row_noise_inverse(level,inverse);
+    for(unsigned y=0;y<height;y++)row_noise_correct_row(offset,y,width,height,level,inverse,rgb+(size_t)y*width*3);
 }
